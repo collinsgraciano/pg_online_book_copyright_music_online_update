@@ -581,6 +581,19 @@ def normalize_text_items(value):
     return normalized
 
 
+def make_json_compatible(value):
+    """Recursively convert runtime objects into JSON-safe values."""
+    if isinstance(value, dict):
+        return {str(key): make_json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [make_json_compatible(item) for item in value]
+    if isinstance(value, (dt_module.datetime, dt_module.date, dt_module.time)):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
 def append_unique_text_items(existing_value, additions):
     items = normalize_text_items(existing_value)
     seen = set(items)
@@ -1518,6 +1531,7 @@ def normalize_split_state_from_row(row):
             state = {}
     if not isinstance(state, dict):
         state = {}
+    state = make_json_compatible(state)
 
     book_id = str(row.get("book_id") or state.get("book_id") or "").strip()
     state["book_id"] = book_id
@@ -1538,8 +1552,8 @@ def normalize_split_state_from_row(row):
         else state.get("completed_part_count", 0)
     )
     state["part_count"] = int(row.get("part_count") if row.get("part_count") is not None else state.get("part_count", 0))
-    state["updated_at"] = row.get("updated_at") or state.get("updated_at", "")
-    state["created_at"] = row.get("created_at") or state.get("created_at", "")
+    state["updated_at"] = make_json_compatible(row.get("updated_at")) or state.get("updated_at", "")
+    state["created_at"] = make_json_compatible(row.get("created_at")) or state.get("created_at", "")
     state["state_path"] = build_split_state_ref(book_id, row.get("project_flag"))
     return state
 
@@ -1616,6 +1630,9 @@ def save_split_processing_state(book_record, state):
     state["book_name"] = book_record.get("book_name") or state.get("book_name", "")
     state["category"] = book_record.get("category") or state.get("category", "")
     state["created_at"] = state.get("created_at") or now
+    state_json_payload = make_json_compatible(state)
+    state.clear()
+    state.update(state_json_payload)
 
     try:
         execute_postgres(
