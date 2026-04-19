@@ -2660,6 +2660,66 @@ def is_modelscope_http_429_error(error):
     )
 
 
+class CoverGenerationPolicyRejectedError(RuntimeError):
+    """Raised when the provider rejects image generation input and we should fallback."""
+
+
+def _extract_http_error_details(error):
+    response = getattr(error, "response", None)
+    request = getattr(error, "request", None)
+    status_code = getattr(response, "status_code", None)
+    request_url = str(getattr(request, "url", "") or getattr(response, "url", "") or "")
+    response_text = ""
+    if response is not None:
+        try:
+            response_text = str(response.text or "")
+        except Exception:
+            response_text = ""
+    return status_code, request_url, response_text
+
+
+def is_modelscope_image_review_rejection_error(error):
+    status_code, request_url, response_text = _extract_http_error_details(error)
+    merged_text = "\n".join(part for part in [str(error or ""), response_text] if part).lower()
+    request_url = request_url.lower()
+    review_keywords = (
+        "敏感",
+        "审核",
+        "review",
+        "sensitive",
+        "moderation",
+        "unsafe",
+        "violation",
+        "违规",
+    )
+    if any(keyword in merged_text for keyword in review_keywords):
+        return "images/generations" in (merged_text + "\n" + request_url)
+    return status_code == 400 and "api-inference.modelscope.cn/v1/images/generations" in request_url
+
+
+def _is_nonempty_local_file(path):
+    return bool(path and os.path.exists(path) and os.path.getsize(path) > 0)
+
+
+def _persist_cover_fallback_image(source_path, target_path):
+    if not _is_nonempty_local_file(source_path):
+        return ""
+
+    if os.path.abspath(source_path) == os.path.abspath(target_path):
+        return target_path
+
+    try:
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        with Image.open(source_path) as img:
+            img.convert("RGB").save(target_path, format="JPEG", quality=95)
+        if _is_nonempty_local_file(target_path):
+            return target_path
+    except Exception as e:
+        log.warning("原始封面转存为标准 JPEG 失败，将继续直接使用原文件：%s", e)
+
+    return source_path
+
+
 def _read_positive_int_runtime_config(name, default_value):
     try:
         value = int(globals().get(name, default_value) or default_value)
@@ -2875,6 +2935,11 @@ def _try_generate_cover_with_image_model(output_path, draw_prompt, img_size, ima
 
             raise ValueError("URL 下载到本地图盘时文件被截断了。")
         except Exception as e:
+            if is_modelscope_image_review_rejection_error(e):
+                raise CoverGenerationPolicyRejectedError(
+                    f"{image_model} 生图请求疑似触发提供商审核拒绝，不再继续重试：{e}"
+                ) from e
+
             failure_count += 1
             failure_messages.append(str(e))
             has_next_token = token_index < len(active_tokens)
@@ -4070,18 +4135,24 @@ def prepare_book_cover_and_seo(result, book_data, book_dir, safe_name, book_name
         and os.path.exists(result.seo_text_path)
         and os.path.getsize(result.seo_text_path) > 0
     )
+    cover_ready = _is_nonempty_local_file(result.cover_image_path)
+    fallback_cover_path = result.cover_image_path if cover_ready and not ai_cover_ready else ""
 
     pic_url = book_data.get("picUrl", "")
     if pic_url:
         ext = pic_url.split("?")[0].rsplit(".", 1)[-1] or "jpg"
         cover_path = os.path.join(book_dir, f"cover.{ext}")
         if download_file(pic_url, cover_path):
-            result.cover_image_path = cover_path
+            fallback_cover_path = cover_path
+            if not ai_cover_ready:
+                result.cover_image_path = cover_path
+                cover_ready = True
             log.info("原始封面已准备完成：%s", os.path.basename(cover_path))
 
     if ENABLE_COVER_GENERATION and not ai_cover_ready and SKIP_EXISTING and os.path.exists(ai_cover_target_path) and os.path.getsize(ai_cover_target_path) > 0:
         result.cover_image_path = ai_cover_target_path
         ai_cover_ready = True
+        cover_ready = True
         log.info("[%s] 复用已生成的 AI 封面。", book_name)
 
     if ENABLE_SEO_GENERATION and not seo_ready and SKIP_EXISTING and os.path.exists(seo_path_ai) and os.path.getsize(seo_path_ai) > 0:
@@ -4104,11 +4175,28 @@ def prepare_book_cover_and_seo(result, book_data, book_dir, safe_name, book_name
 
     if ENABLE_COVER_GENERATION and not ai_cover_ready:
         book_desc_text = str(book_data.get("keyWord", "")) + " " + str(book_data.get("bookDescription", ""))
-        ok_cover = auto_create_youtube_cover(book_name, book_desc_text, ai_cover_target_path, token_pool, VIDEO_RESOLUTION)
+        try:
+            ok_cover = auto_create_youtube_cover(book_name, book_desc_text, ai_cover_target_path, token_pool, VIDEO_RESOLUTION)
+        except CoverGenerationPolicyRejectedError as e:
+            if not _is_nonempty_local_file(fallback_cover_path):
+                raise RuntimeError("AI 封面命中提供商审核拒绝，且 books 数据中没有可用封面可回退，停止后续处理。") from e
+
+            result.cover_image_path = _persist_cover_fallback_image(fallback_cover_path, ai_cover_target_path)
+            cover_ready = _is_nonempty_local_file(result.cover_image_path)
+            ai_cover_ready = os.path.abspath(result.cover_image_path) == os.path.abspath(ai_cover_target_path) and cover_ready
+            log.warning(
+                "[%s] AI 封面命中提供商审核拒绝，已停止继续重试并改用 books 数据封面：%s | %s",
+                book_name,
+                os.path.basename(result.cover_image_path),
+                e,
+            )
+            ok_cover = True
         if not ok_cover:
             raise RuntimeError("AI 封面生成未成功，停止后续处理。")
-        result.cover_image_path = ai_cover_target_path
-        ai_cover_ready = True
+        if _is_nonempty_local_file(ai_cover_target_path):
+            result.cover_image_path = ai_cover_target_path
+            ai_cover_ready = True
+            cover_ready = True
 
     if ENABLE_SEO_GENERATION and not seo_ready:
         book_desc_text = str(book_data.get("keyWord", "")) + " " + str(book_data.get("bookDescription", ""))
@@ -4121,8 +4209,9 @@ def prepare_book_cover_and_seo(result, book_data, book_dir, safe_name, book_name
         result.seo_tags = seo_dict.get("label", "")
         seo_ready = True
 
-    if ENABLE_COVER_GENERATION and not ai_cover_ready:
-        raise RuntimeError("已开启 AI 封面生成，但封面未生成成功，停止后续处理。")
+    cover_ready = _is_nonempty_local_file(result.cover_image_path)
+    if ENABLE_COVER_GENERATION and not cover_ready:
+        raise RuntimeError("已开启 AI 封面生成，但封面既未生成成功，也没有可用的 books 封面可回退，停止后续处理。")
 
     if ENABLE_SEO_GENERATION and not seo_ready:
         raise RuntimeError("已开启 SEO 生成，但文案未生成成功，停止后续处理。")
