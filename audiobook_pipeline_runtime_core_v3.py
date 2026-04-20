@@ -32,6 +32,7 @@ DEFAULT_RUNTIME_CONFIG = {'POSTGRES_DSN': '',
  'LONG_AUDIO_SPLIT_TRIGGER_HOURS': 12.0,
  'LONG_AUDIO_PART_TARGET_HOURS': 11.8,
  'BOOK_STATE_TABLE': 'book_processing_states',
+ 'CLEANUP_COMPLETED_SPLIT_STATES': True,
  'PRIORITIZE_INTERRUPTED_BOOKS': True,
  'ENABLE_DEEPFILTER': True,
  'segment_duration_minutes': 60,
@@ -1639,6 +1640,35 @@ def build_split_state_ref(book_id, project_flag=None):
     return f"postgres:{get_book_state_table_name()}:{flag}:{book_id}"
 
 
+def _read_bool_runtime_config(name, default=False):
+    value = globals().get(name, default)
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _should_cleanup_completed_split_states():
+    return _read_bool_runtime_config("CLEANUP_COMPLETED_SPLIT_STATES", False)
+
+
+def _build_split_part_lookup_key(part_like):
+    if not isinstance(part_like, dict):
+        return ()
+
+    chapter_ids = part_like.get("chapter_ids") or []
+    normalized_ids = tuple(str(item).strip() for item in chapter_ids if str(item).strip())
+    if normalized_ids:
+        return ("chapter_ids",) + normalized_ids
+
+    start_index = str(part_like.get("chapter_start_index") or "").strip()
+    end_index = str(part_like.get("chapter_end_index") or "").strip()
+    if start_index or end_index:
+        return ("range", start_index, end_index)
+
+    part_index = str(part_like.get("part_index") or "").strip()
+    return ("part_index", part_index) if part_index else ()
+
+
 def _split_part_has_uploaded_video(part_state):
     if not isinstance(part_state, dict):
         return False
@@ -1886,6 +1916,9 @@ def delete_split_processing_state(book_record, only_if_completed=False):
 
 
 def cleanup_completed_split_states(project_flag=None, category=None):
+    if not _should_cleanup_completed_split_states():
+        return 0
+
     table_name = get_book_state_table_name()
     table_sql = get_public_table_identifier(table_name)
     flag = str(PROJECT_FLAG if project_flag is None else project_flag).strip()
@@ -1980,17 +2013,37 @@ def initialize_split_processing_state(book_record, book_dir, chapters_sorted, sp
     existing = load_split_processing_state(book_record) or {}
 
     reuse_existing = isinstance(existing, dict) and existing.get("plan_signature") == signature
-    existing_parts = {}
-    if reuse_existing:
-        existing_parts = {
-            int(item.get("part_index")): item
-            for item in existing.get("parts", [])
-            if isinstance(item, dict) and str(item.get("part_index", "")).isdigit()
-        }
+    compatible_reuse = isinstance(existing, dict) and bool(existing.get("parts"))
+    existing_parts_by_index = {}
+    existing_parts_by_key = {}
+    if compatible_reuse:
+        for item in existing.get("parts", []):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("part_index", "")).isdigit():
+                existing_parts_by_index[int(item.get("part_index"))] = item
+            part_key = _build_split_part_lookup_key(item)
+            if part_key and part_key not in existing_parts_by_key:
+                existing_parts_by_key[part_key] = item
 
     parts_state = []
+    matched_existing_parts = 0
     for part in split_plan.get("parts", []):
-        previous = existing_parts.get(part["part_index"], {})
+        part_key = _build_split_part_lookup_key(
+            {
+                "part_index": part["part_index"],
+                "chapter_start_index": part["chapter_start_index"],
+                "chapter_end_index": part["chapter_end_index"],
+                "chapter_ids": [item.get("chapter_id") for item in part.get("items", [])],
+            }
+        )
+        previous = {}
+        if reuse_existing:
+            previous = existing_parts_by_index.get(part["part_index"], {})
+        if not previous and part_key:
+            previous = existing_parts_by_key.get(part_key, {})
+        if previous:
+            matched_existing_parts += 1
         parts_state.append(
             {
                 "part_index": part["part_index"],
@@ -1998,7 +2051,7 @@ def initialize_split_processing_state(book_record, book_dir, chapters_sorted, sp
                 "chapter_end_index": part["chapter_end_index"],
                 "estimated_duration_seconds": part["estimated_duration_seconds"],
                 "chapter_ids": [item.get("chapter_id") for item in part.get("items", [])],
-                "status": previous.get("status", "pending") if reuse_existing else "pending",
+                "status": previous.get("status", "pending") if previous else "pending",
                 "started_at": previous.get("started_at", ""),
                 "completed_at": previous.get("completed_at", ""),
                 "last_stage": previous.get("last_stage", ""),
@@ -2017,6 +2070,9 @@ def initialize_split_processing_state(book_record, book_dir, chapters_sorted, sp
             }
         )
 
+    structure_compatible = bool(parts_state) and matched_existing_parts == len(parts_state)
+    if structure_compatible and compatible_reuse and not reuse_existing:
+        log.info("检测到分片结构兼容，虽然计划签名变化，仍继续复用已有多 P 状态以避免重复上传。")
     state = {
         "state_version": 5,
         "mode": "split_upload",
@@ -2029,12 +2085,12 @@ def initialize_split_processing_state(book_record, book_dir, chapters_sorted, sp
         "estimated_total_seconds": split_plan.get("estimated_total_seconds", 0),
         "part_count": len(parts_state),
         "parts": parts_state,
-        "shared_assets": existing.get("shared_assets", {}) if reuse_existing else {},
-        "playlist": existing.get("playlist", {}) if reuse_existing else {},
-        "last_stage": existing.get("last_stage", "plan_ready") if reuse_existing else "plan_ready",
-        "last_error": existing.get("last_error", "") if reuse_existing else "",
-        "pending_resume": bool(existing.get("pending_resume")) if reuse_existing else True,
-        "created_at": existing.get("created_at") if reuse_existing else dt_module.datetime.now().isoformat(),
+        "shared_assets": existing.get("shared_assets", {}) if structure_compatible else {},
+        "playlist": existing.get("playlist", {}) if structure_compatible else {},
+        "last_stage": existing.get("last_stage", "plan_ready") if structure_compatible else "plan_ready",
+        "last_error": existing.get("last_error", "") if structure_compatible else "",
+        "pending_resume": bool(existing.get("pending_resume")) if structure_compatible else True,
+        "created_at": existing.get("created_at") if compatible_reuse else dt_module.datetime.now().isoformat(),
     }
     state_ref = save_split_processing_state(book_record, state)
     return state_ref, state
@@ -5120,6 +5176,9 @@ def sync_result_from_split_state(result, state, split_plan):
 
 
 def cleanup_completed_split_state_for_book(book_record, result, book_name):
+    if not _should_cleanup_completed_split_states():
+        return result
+
     try:
         if delete_split_processing_state(book_record, only_if_completed=True):
             result.state_path = ""
@@ -5359,7 +5418,6 @@ def process_split_book(result, book_record, book_data, chapters_sorted, book_dir
     if state.get("status") == "completed" and (not playlist_required or playlist_completed):
         sync_result_from_split_state(result, state, split_plan)
         result.pending_resume = False
-        cleanup_completed_split_state_for_book(book_record, result, book_name)
         return result
     elif state.get("status") == "completed" and playlist_required and not playlist_completed:
         log.info("[%s] 检测到分片上传已完成但播放列表尚未补齐，将继续恢复 playlist。", book_name)
@@ -5440,7 +5498,6 @@ def process_split_book(result, book_record, book_data, chapters_sorted, book_dir
         sync_result_from_split_state(result, state, split_plan)
         result.pending_resume = False
         result.error = ""
-        cleanup_completed_split_state_for_book(book_record, result, book_name)
     elif not result.error:
         result.error = "长音频分片处理中断，已记录进度，等待下次续跑"
 
@@ -5567,10 +5624,6 @@ def run_pipeline(runtime_config: dict | None = None):
     applied_cloud_overrides = apply_cloud_runtime_overrides()
     if applied_cloud_overrides:
         log.info("已应用云端运行配置覆盖: %s", "、".join(sorted(applied_cloud_overrides.keys())))
-
-    deleted_completed_states = cleanup_completed_split_states()
-    if deleted_completed_states > 0:
-        log.info("已清理 %d 条已完成的长音频分片状态，避免继续占用数据库空间", deleted_completed_states)
 
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
@@ -5702,6 +5755,8 @@ def run_pipeline(runtime_config: dict | None = None):
                 _update_book_status_in_database(book["book_id"], new_status)
                 book["status"] = new_status
                 log.info("🎉 完成并标记 status='%s'", new_status)
+                if getattr(result, "split_mode", False):
+                    cleanup_completed_split_state_for_book(book, result, name)
             except Exception as e:
                 log.error("标记 status 失败: %s", e)
 
