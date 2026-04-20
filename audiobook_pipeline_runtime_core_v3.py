@@ -45,6 +45,7 @@ DEFAULT_RUNTIME_CONFIG = {'POSTGRES_DSN': '',
  'ENABLE_YOUTUBE_UPLOAD': True,
  'YOUTUBE_PRIVACY_STATUS': 'schedule',
  'YOUTUBE_SCHEDULE_AFTER_HOURS': 24,
+ 'YOUTUBE_DAILY_PUBLISH_LIMIT': 3,
  'YOUTUBE_CATEGORY_ID': '',
  'APPEND_TAGS_TO_TITLE': False,
  'APPEND_TAGS_TO_DESC': True,
@@ -1221,6 +1222,122 @@ def read_json_file(path, default=None):
         return default
 
 
+def _normalize_local_path_for_compare(path):
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    return os.path.normcase(os.path.abspath(text))
+
+
+def _capture_local_file_signature(path):
+    normalized_path = _normalize_local_path_for_compare(path)
+    signature = {"path": normalized_path}
+    if not normalized_path or not os.path.exists(path):
+        return signature
+
+    stat = os.stat(path)
+    signature["size"] = int(stat.st_size)
+    signature["mtime_ns"] = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)))
+    return signature
+
+
+def persist_youtube_upload_receipt(
+    receipt_path,
+    video_path,
+    upload_result,
+    channel_name="",
+    title="",
+    privacy_status="",
+    category_id="",
+    schedule_after_hours=0,
+):
+    if not isinstance(upload_result, dict):
+        return ""
+
+    youtube_url = str(upload_result.get("youtube_url") or "").strip()
+    video_id = str(upload_result.get("video_id") or "").strip()
+    if not youtube_url and not video_id:
+        return ""
+
+    payload = {
+        "receipt_version": 1,
+        "saved_at": dt_module.datetime.now().isoformat(),
+        "channel_name": str(channel_name or "").strip(),
+        "title": str(title or upload_result.get("title") or "").strip(),
+        "privacy_status": str(privacy_status or "").strip(),
+        "category_id": str(category_id or "").strip(),
+        "schedule_after_hours": int(schedule_after_hours or 0),
+        "video_file": _capture_local_file_signature(video_path),
+        "video_id": video_id,
+        "youtube_url": youtube_url,
+        "uploaded_at": str(upload_result.get("uploaded_at") or "").strip(),
+        "publish_at": str(upload_result.get("publish_at") or "").strip(),
+        "schedule_reason": str(upload_result.get("schedule_reason") or "").strip(),
+    }
+    write_json_file(receipt_path, payload)
+    return receipt_path
+
+
+def load_youtube_upload_receipt(receipt_path, video_path="", channel_name=""):
+    receipt = read_json_file(receipt_path, default={}) or {}
+    if not isinstance(receipt, dict) or (not receipt.get("youtube_url") and not receipt.get("video_id")):
+        fallback_report = read_json_file(os.path.join(os.path.dirname(receipt_path), "book_result.json"), default={}) or {}
+        fallback_result = fallback_report.get("result") if isinstance(fallback_report, dict) else {}
+        if isinstance(fallback_result, dict) and (
+            str(fallback_result.get("youtube_url") or "").strip() or str(fallback_result.get("youtube_urls") or "").strip()
+        ):
+            fallback_url = str(fallback_result.get("youtube_url") or "").strip()
+            if "\n" in fallback_url:
+                fallback_url = fallback_url.splitlines()[0].strip()
+            receipt = {
+                "channel_name": "",
+                "title": str(fallback_result.get("seo_title") or "").strip(),
+                "video_file": _capture_local_file_signature(fallback_result.get("video_path")),
+                "video_id": "",
+                "youtube_url": fallback_url,
+                "uploaded_at": str(fallback_result.get("youtube_publish_at") or "").strip(),
+                "publish_at": str(fallback_result.get("youtube_publish_at") or "").strip(),
+                "schedule_reason": str(fallback_result.get("youtube_schedule_reason") or "").strip(),
+            }
+    if not isinstance(receipt, dict):
+        return {}
+
+    youtube_url = str(receipt.get("youtube_url") or "").strip()
+    video_id = str(receipt.get("video_id") or "").strip()
+    if not youtube_url and not video_id:
+        return {}
+
+    expected_channel = str(channel_name or "").strip()
+    receipt_channel = str(receipt.get("channel_name") or "").strip()
+    if expected_channel and receipt_channel and receipt_channel != expected_channel:
+        return {}
+
+    if video_path:
+        current_signature = _capture_local_file_signature(video_path)
+        if not current_signature.get("path") or int(current_signature.get("size") or 0) <= 0:
+            return {}
+
+        receipt_signature = receipt.get("video_file") or {}
+        receipt_path_text = _normalize_local_path_for_compare(receipt_signature.get("path"))
+        if receipt_path_text and receipt_path_text != current_signature["path"]:
+            return {}
+
+        if receipt_signature.get("size") is not None and int(receipt_signature.get("size") or 0) != int(current_signature.get("size") or 0):
+            return {}
+
+        if receipt_signature.get("mtime_ns") is not None and int(receipt_signature.get("mtime_ns") or 0) != int(current_signature.get("mtime_ns") or 0):
+            return {}
+
+    return {
+        "video_id": video_id,
+        "youtube_url": youtube_url,
+        "uploaded_at": str(receipt.get("uploaded_at") or "").strip(),
+        "publish_at": str(receipt.get("publish_at") or "").strip(),
+        "schedule_reason": str(receipt.get("schedule_reason") or "").strip(),
+        "title": str(receipt.get("title") or "").strip(),
+    }
+
+
 def get_book_state_table_name():
     return str(BOOK_STATE_TABLE or "book_processing_states").strip() or "book_processing_states"
 
@@ -1522,6 +1639,48 @@ def build_split_state_ref(book_id, project_flag=None):
     return f"postgres:{get_book_state_table_name()}:{flag}:{book_id}"
 
 
+def _split_part_has_uploaded_video(part_state):
+    if not isinstance(part_state, dict):
+        return False
+    return bool(str(part_state.get("video_id") or "").strip() or str(part_state.get("youtube_url") or "").strip())
+
+
+def _split_part_is_completed(part_state):
+    if not isinstance(part_state, dict):
+        return False
+
+    if str(part_state.get("status") or "").strip().lower() == "completed":
+        return True
+
+    if ENABLE_YOUTUBE_UPLOAD and str(YOUTUBE_CHANNEL_NAME or "").strip():
+        return _split_part_has_uploaded_video(part_state)
+    if ENABLE_VIDEO_GENERATION:
+        return _is_nonempty_local_file(part_state.get("video_path"))
+    return _is_nonempty_local_file(part_state.get("audio_path"))
+
+
+def _reconcile_split_part_state(part_state):
+    if not isinstance(part_state, dict):
+        return False
+    if not _split_part_is_completed(part_state):
+        return False
+
+    changed = False
+    if str(part_state.get("status") or "").strip().lower() != "completed":
+        part_state["status"] = "completed"
+        changed = True
+    if not str(part_state.get("completed_at") or "").strip():
+        part_state["completed_at"] = dt_module.datetime.now().isoformat()
+        changed = True
+    if str(part_state.get("last_stage") or "").strip() != "completed":
+        part_state["last_stage"] = "completed"
+        changed = True
+    if str(part_state.get("error") or "").strip():
+        part_state["error"] = ""
+        changed = True
+    return changed
+
+
 def normalize_split_state_from_row(row):
     state = row.get("state_json") or {}
     if isinstance(state, str):
@@ -1602,22 +1761,39 @@ def load_split_processing_state(book_record):
 def save_split_processing_state(book_record, state):
     now = dt_module.datetime.now().isoformat()
     parts = state.get("parts", [])
-    completed_count = sum(1 for item in parts if item.get("status") == "completed")
+    for item in parts:
+        _reconcile_split_part_state(item)
+
+    completed_count = sum(1 for item in parts if _split_part_is_completed(item))
     state["completed_part_count"] = completed_count
     state["part_count"] = max(1, int(state.get("part_count") or len(parts) or 1))
-    pending_parts = [item.get("part_index") for item in parts if item.get("status") != "completed"]
+    pending_parts = [item.get("part_index") for item in parts if not _split_part_is_completed(item)]
     state["current_part_index"] = pending_parts[0] if pending_parts else None
     state["updated_at"] = now
 
     all_parts_completed = completed_count >= state["part_count"]
-    pending_resume = bool(state.get("pending_resume", False))
+    playlist_state = get_split_playlist_state(state) if state.get("mode") == "split_upload" else {}
+    playlist_required = bool(
+        state.get("mode") == "split_upload"
+        and state["part_count"] > 1
+        and ENABLE_YOUTUBE_UPLOAD
+        and str(YOUTUBE_CHANNEL_NAME or "").strip()
+    )
+    playlist_completed = (
+        not playlist_required
+        or (
+            bool(playlist_state.get("playlist_id"))
+            and str(playlist_state.get("status") or "").strip().lower() == "completed"
+        )
+    )
 
-    if all_parts_completed and not pending_resume:
+    if all_parts_completed and playlist_completed:
         state["status"] = "completed"
         state["pending_resume"] = False
         state["completed_at"] = state.get("completed_at") or now
     else:
         state["status"] = "in_progress"
+        state["pending_resume"] = True
         state.pop("completed_at", None)
 
     book_id = str(book_record.get("book_id") or state.get("book_id") or "").strip()
@@ -3272,7 +3448,7 @@ try:
     YOUTUBE_SCHEDULE_LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 except Exception:
     YOUTUBE_SCHEDULE_LOCAL_TIMEZONE = dt_timezone(dt_timedelta(hours=8))
-YOUTUBE_DAILY_PUBLISH_LIMIT = 3
+YOUTUBE_DAILY_PUBLISH_LIMIT = max(1, int(globals().get("YOUTUBE_DAILY_PUBLISH_LIMIT", 3) or 3))
 
 def authenticate_youtube_from_supabase(channel_name):
     """从数据库获取指定频道的 YouTube Token，并在需要时自动刷新。"""
@@ -3529,12 +3705,16 @@ def _collect_channel_publish_schedule_facts_with_client(youtube, now_utc):
         return {
             "uploads_playlist_id": uploads_playlist_id,
             "published_count_by_local_date": {},
+            "future_count_by_local_date": {},
+            "future_publish_times_by_local_date": {},
             "latest_future_publish_at": None,
             "video_count": 0,
         }
 
     rows = _fetch_video_status_rows_with_client(youtube, video_ids)
     published_count_by_local_date = {}
+    future_count_by_local_date = {}
+    future_publish_times_by_local_date = {}
     latest_future_publish_at = None
 
     for row in rows:
@@ -3548,13 +3728,54 @@ def _collect_channel_publish_schedule_facts_with_client(youtube, now_utc):
             latest_future_publish_at is None or future_publish_at > latest_future_publish_at
         ):
             latest_future_publish_at = future_publish_at
+        if future_publish_at is not None:
+            local_publish_at = future_publish_at.astimezone(YOUTUBE_SCHEDULE_LOCAL_TIMEZONE).replace(microsecond=0)
+            local_day = local_publish_at.date().isoformat()
+            future_count_by_local_date[local_day] = future_count_by_local_date.get(local_day, 0) + 1
+            future_publish_times_by_local_date.setdefault(local_day, []).append(local_publish_at)
+
+    for local_day, items in future_publish_times_by_local_date.items():
+        future_publish_times_by_local_date[local_day] = sorted(items)
 
     return {
         "uploads_playlist_id": uploads_playlist_id,
         "published_count_by_local_date": published_count_by_local_date,
+        "future_count_by_local_date": future_count_by_local_date,
+        "future_publish_times_by_local_date": future_publish_times_by_local_date,
         "latest_future_publish_at": latest_future_publish_at,
         "video_count": len(rows),
     }
+
+
+def _get_youtube_daily_publish_limit():
+    try:
+        limit = int(globals().get("YOUTUBE_DAILY_PUBLISH_LIMIT", 3) or 3)
+    except Exception:
+        limit = 3
+    return max(1, limit)
+
+
+def _build_youtube_daily_publish_slots(target_date, base_publish_at_local, daily_limit):
+    base_time = base_publish_at_local.timetz().replace(microsecond=0)
+    day_start = dt_datetime.combine(target_date, base_time, tzinfo=YOUTUBE_SCHEDULE_LOCAL_TIMEZONE).replace(microsecond=0)
+    day_end = day_start.replace(hour=23, minute=55, second=0, microsecond=0)
+    if day_end <= day_start:
+        day_end = day_start + dt_timedelta(minutes=10 * max(0, daily_limit - 1))
+
+    if daily_limit <= 1:
+        return [day_start]
+
+    interval_seconds = max(600, int((day_end - day_start).total_seconds() // max(1, daily_limit - 1)))
+    slots = []
+    for slot_index in range(daily_limit):
+        candidate = day_start + dt_timedelta(seconds=interval_seconds * slot_index)
+        if candidate > day_end:
+            candidate = day_end
+        candidate = candidate.replace(microsecond=0)
+        if slots and candidate <= slots[-1]:
+            candidate = (slots[-1] + dt_timedelta(minutes=10)).replace(microsecond=0)
+        slots.append(candidate)
+    return slots
 
 
 def resolve_youtube_publish_schedule_with_client(youtube, privacy_status="unlisted", schedule_after_hours=0):
@@ -3576,24 +3797,51 @@ def resolve_youtube_publish_schedule_with_client(youtube, privacy_status="unlist
     facts = _collect_channel_publish_schedule_facts_with_client(youtube, now_utc)
     latest_future_publish_at = facts.get("latest_future_publish_at")
     published_count_by_local_date = facts.get("published_count_by_local_date", {})
+    future_count_by_local_date = facts.get("future_count_by_local_date", {})
+    future_publish_times_by_local_date = facts.get("future_publish_times_by_local_date", {})
+    daily_limit = _get_youtube_daily_publish_limit()
 
     schedule_reason = "base_schedule"
     final_publish_at_local = base_publish_at_local
     final_publish_at_utc = base_publish_at_utc
 
-    if latest_future_publish_at is not None:
-        latest_future_local = latest_future_publish_at.astimezone(YOUTUBE_SCHEDULE_LOCAL_TIMEZONE).replace(microsecond=0)
-        rolled_publish_at_local = (latest_future_local + dt_timedelta(days=1)).replace(microsecond=0)
-        rolled_publish_at_utc = rolled_publish_at_local.astimezone(dt_timezone.utc).replace(microsecond=0)
-        if rolled_publish_at_utc >= base_publish_at_utc:
-            final_publish_at_local = rolled_publish_at_local
-            final_publish_at_utc = rolled_publish_at_utc
-            schedule_reason = "latest_scheduled_rollover"
-    else:
-        while published_count_by_local_date.get(final_publish_at_local.date().isoformat(), 0) >= YOUTUBE_DAILY_PUBLISH_LIMIT:
-            final_publish_at_local = (final_publish_at_local + dt_timedelta(days=1)).replace(microsecond=0)
-            final_publish_at_utc = final_publish_at_local.astimezone(dt_timezone.utc).replace(microsecond=0)
-            schedule_reason = "daily_limit_rollover"
+    candidate_day = base_publish_at_local.date()
+    base_day = candidate_day
+    found_slot = False
+    for day_offset in range(370):
+        current_day = candidate_day + dt_timedelta(days=day_offset)
+        local_day_key = current_day.isoformat()
+        reserved_count = int(published_count_by_local_date.get(local_day_key, 0) or 0) + int(
+            future_count_by_local_date.get(local_day_key, 0) or 0
+        )
+        if reserved_count >= daily_limit:
+            continue
+
+        occupied_times = list(future_publish_times_by_local_date.get(local_day_key, []) or [])
+        slots = _build_youtube_daily_publish_slots(current_day, base_publish_at_local, daily_limit)
+        earliest_allowed = base_publish_at_local if current_day == base_day else slots[0]
+        for slot in slots:
+            if slot < earliest_allowed:
+                continue
+            if any(abs((slot - occupied).total_seconds()) < 60 for occupied in occupied_times):
+                continue
+            final_publish_at_local = slot
+            final_publish_at_utc = slot.astimezone(dt_timezone.utc).replace(microsecond=0)
+            schedule_reason = f"daily_slot_{reserved_count + 1}_of_{daily_limit}"
+            found_slot = True
+            break
+
+        if not found_slot and reserved_count < daily_limit:
+            fallback_anchor = max([earliest_allowed] + occupied_times) if occupied_times else earliest_allowed
+            fallback_slot = (fallback_anchor + dt_timedelta(minutes=10)).replace(microsecond=0)
+            if fallback_slot.date() == current_day:
+                final_publish_at_local = fallback_slot
+                final_publish_at_utc = fallback_slot.astimezone(dt_timezone.utc).replace(microsecond=0)
+                schedule_reason = f"daily_fallback_{reserved_count + 1}_of_{daily_limit}"
+                found_slot = True
+
+        if found_slot:
+            break
 
     publish_at = _format_youtube_datetime_z(final_publish_at_utc)
     base_publish_at = _format_youtube_datetime_z(base_publish_at_utc)
@@ -4734,23 +4982,45 @@ def process_standard_book(result, book_record, book_data, chapters_sorted, book_
     if ENABLE_YOUTUBE_UPLOAD and YOUTUBE_CHANNEL_NAME.strip():
         if result.video_path and os.path.exists(result.video_path):
             try:
+                upload_receipt_path = os.path.join(book_dir, "youtube_upload_receipt.json")
                 final_title, final_desc, final_tags = build_youtube_payload(
                     result,
                     book_name,
                     category,
                     youtube_chapters=result.youtube_chapters,
                 )
-                upload_result = upload_to_youtube_detailed(
-                    video_path=result.video_path,
-                    title=final_title,
-                    description=final_desc,
-                    tags=final_tags,
-                    cover_path=result.cover_image_path,
-                    channel_name=str(YOUTUBE_CHANNEL_NAME).strip(),
-                    privacy_status=str(YOUTUBE_PRIVACY_STATUS).strip(),
-                    category_id=str(YOUTUBE_CATEGORY_ID).strip(),
-                    schedule_after_hours=YOUTUBE_SCHEDULE_AFTER_HOURS,
-                )
+                upload_result = {}
+                if not FORCE_REPROCESS:
+                    upload_result = load_youtube_upload_receipt(
+                        upload_receipt_path,
+                        video_path=result.video_path,
+                        channel_name=str(YOUTUBE_CHANNEL_NAME).strip(),
+                    )
+                if upload_result:
+                    log.info("[%s] 复用本地 YouTube 上传回执，跳过重复上传。", book_name)
+                else:
+                    upload_result = upload_to_youtube_detailed(
+                        video_path=result.video_path,
+                        title=final_title,
+                        description=final_desc,
+                        tags=final_tags,
+                        cover_path=result.cover_image_path,
+                        channel_name=str(YOUTUBE_CHANNEL_NAME).strip(),
+                        privacy_status=str(YOUTUBE_PRIVACY_STATUS).strip(),
+                        category_id=str(YOUTUBE_CATEGORY_ID).strip(),
+                        schedule_after_hours=YOUTUBE_SCHEDULE_AFTER_HOURS,
+                    )
+                    if upload_result:
+                        persist_youtube_upload_receipt(
+                            upload_receipt_path,
+                            video_path=result.video_path,
+                            upload_result=upload_result,
+                            channel_name=str(YOUTUBE_CHANNEL_NAME).strip(),
+                            title=final_title,
+                            privacy_status=str(YOUTUBE_PRIVACY_STATUS).strip(),
+                            category_id=str(YOUTUBE_CATEGORY_ID).strip(),
+                            schedule_after_hours=YOUTUBE_SCHEDULE_AFTER_HOURS,
+                        )
                 if upload_result:
                     result.youtube_url = upload_result.get("youtube_url", "")
                     result.youtube_urls = [result.youtube_url] if result.youtube_url else []
@@ -4789,8 +5059,6 @@ def build_part_result_record(part_plan, part_state):
 
 def sync_result_from_split_state(result, state, split_plan):
     result.part_count = len(split_plan.get("parts", [])) or 1
-    result.completed_part_count = int(state.get("completed_part_count") or 0)
-    result.pending_resume = result.completed_part_count < result.part_count
     result.part_results = []
     result.youtube_urls = []
     result.youtube_publish_at = ""
@@ -4802,6 +5070,8 @@ def sync_result_from_split_state(result, state, split_plan):
     result.playlist_id = str(playlist_state.get("playlist_id") or "")
     result.playlist_url = str(playlist_state.get("playlist_url") or "")
     result.playlist_title = str(playlist_state.get("title") or "")
+    playlist_required = bool(result.part_count > 1 and ENABLE_YOUTUBE_UPLOAD and str(YOUTUBE_CHANNEL_NAME or "").strip())
+    playlist_completed = bool(result.playlist_id) and str(playlist_state.get("status") or "").strip().lower() == "completed"
 
     latest_audio_path = ""
     latest_video_path = ""
@@ -4809,12 +5079,15 @@ def sync_result_from_split_state(result, state, split_plan):
     latest_publish_at = ""
     latest_schedule_reason = ""
     all_timestamps = []
+    completed_part_count = 0
 
     for part_plan in split_plan.get("parts", []):
         part_state = get_split_part_state(state, part_plan["part_index"]) or {}
+        _reconcile_split_part_state(part_state)
         result.part_results.append(build_part_result_record(part_plan, part_state))
 
-        if part_state.get("status") == "completed":
+        if _split_part_is_completed(part_state):
+            completed_part_count += 1
             result.success_count += len(part_plan.get("items", []))
 
         if part_state.get("youtube_url"):
@@ -4837,6 +5110,8 @@ def sync_result_from_split_state(result, state, split_plan):
 
     result.merged_audio_path = latest_audio_path
     result.video_path = latest_video_path
+    result.completed_part_count = completed_part_count
+    result.pending_resume = completed_part_count < result.part_count or (playlist_required and not playlist_completed)
     result.youtube_url = "\n".join(result.youtube_urls)
     result.youtube_publish_at = latest_publish_at
     result.youtube_schedule_reason = latest_schedule_reason
@@ -4859,10 +5134,36 @@ def process_split_part(result, state, state_ref, split_plan, part_plan, book_rec
     part_count = len(split_plan.get("parts", []))
     part_state = get_split_part_state(state, part_index)
     part_dir = os.path.join(book_dir, "_split_parts", f"part_{part_index:02d}")
+    upload_receipt_path = os.path.join(part_dir, "youtube_upload_receipt.json")
+    expected_video_path = os.path.join(part_dir, f"{safe_name}_part_{part_index:02d}_final.mp4")
     os.makedirs(part_dir, exist_ok=True)
 
     if part_state is None:
         raise RuntimeError(f"未找到分片状态定义: part {part_index}")
+
+    if ENABLE_VIDEO_GENERATION and _is_nonempty_local_file(expected_video_path):
+        part_state["video_path"] = part_state.get("video_path") or expected_video_path
+
+    if ENABLE_YOUTUBE_UPLOAD and str(YOUTUBE_CHANNEL_NAME or "").strip():
+        reused_upload_result = {}
+        if not FORCE_REPROCESS:
+            reused_upload_result = load_youtube_upload_receipt(
+                upload_receipt_path,
+                video_path=part_state.get("video_path") or expected_video_path,
+                channel_name=str(YOUTUBE_CHANNEL_NAME).strip(),
+            )
+        if reused_upload_result:
+            part_state["video_id"] = str(part_state.get("video_id") or reused_upload_result.get("video_id") or "")
+            part_state["youtube_url"] = str(part_state.get("youtube_url") or reused_upload_result.get("youtube_url") or "")
+            part_state["uploaded_at"] = str(part_state.get("uploaded_at") or reused_upload_result.get("uploaded_at") or "")
+            part_state["publish_at"] = str(part_state.get("publish_at") or reused_upload_result.get("publish_at") or "")
+            part_state["schedule_reason"] = str(part_state.get("schedule_reason") or reused_upload_result.get("schedule_reason") or "")
+            part_state["youtube_title"] = str(part_state.get("youtube_title") or reused_upload_result.get("title") or "")
+
+    if _reconcile_split_part_state(part_state):
+        state["last_error"] = ""
+        state_ref = save_split_processing_state(book_record, state)
+        result.state_path = state_ref
 
     if part_state.get("status") == "completed":
         log.info("[%s] 分片 %d/%d 已完成，跳过重做。", book_name, part_index, part_count)
@@ -4929,7 +5230,7 @@ def process_split_part(result, state, state_ref, split_plan, part_plan, book_rec
             state_ref = save_split_processing_state(book_record, state)
             result.state_path = state_ref
 
-            video_path = os.path.join(part_dir, f"{safe_name}_part_{part_index:02d}_final.mp4")
+            video_path = expected_video_path
             if SKIP_EXISTING and os.path.exists(video_path) and os.path.getsize(video_path) > 0:
                 log.info("[%s] 分片 %d/%d 复用现有 MP4。", book_name, part_index, part_count)
             else:
@@ -4959,19 +5260,40 @@ def process_split_part(result, state, state_ref, split_plan, part_plan, book_rec
                 include_youtube_chapters=False,
                 include_part_hint=False,
             )
-            upload_result = upload_to_youtube_detailed(
+            upload_result = {}
+            if not FORCE_REPROCESS:
+                upload_result = load_youtube_upload_receipt(
+                    upload_receipt_path,
+                    video_path=part_state["video_path"],
+                    channel_name=str(YOUTUBE_CHANNEL_NAME).strip(),
+                )
+            if upload_result:
+                log.info("[%s] Split part %d/%d reuses a saved YouTube upload receipt.", book_name, part_index, part_count)
+            else:
+                upload_result = upload_to_youtube_detailed(
+                    video_path=part_state["video_path"],
+                    title=final_title,
+                    description=final_desc,
+                    tags=final_tags,
+                    cover_path=result.cover_image_path,
+                    channel_name=str(YOUTUBE_CHANNEL_NAME).strip(),
+                    privacy_status=str(YOUTUBE_PRIVACY_STATUS).strip(),
+                    category_id=str(YOUTUBE_CATEGORY_ID).strip(),
+                    schedule_after_hours=YOUTUBE_SCHEDULE_AFTER_HOURS,
+                )
+            if not upload_result:
+                raise RuntimeError("YouTube upload did not complete")
+
+            persist_youtube_upload_receipt(
+                upload_receipt_path,
                 video_path=part_state["video_path"],
-                title=final_title,
-                description=final_desc,
-                tags=final_tags,
-                cover_path=result.cover_image_path,
+                upload_result=upload_result,
                 channel_name=str(YOUTUBE_CHANNEL_NAME).strip(),
+                title=final_title,
                 privacy_status=str(YOUTUBE_PRIVACY_STATUS).strip(),
                 category_id=str(YOUTUBE_CATEGORY_ID).strip(),
                 schedule_after_hours=YOUTUBE_SCHEDULE_AFTER_HOURS,
             )
-            if not upload_result:
-                raise RuntimeError("YouTube 上传未完成")
 
             part_state["youtube_title"] = final_title
             part_state["youtube_url"] = upload_result.get("youtube_url", "")
@@ -4981,6 +5303,11 @@ def process_split_part(result, state, state_ref, split_plan, part_plan, book_rec
             part_state["schedule_reason"] = upload_result.get("schedule_reason", "")
             result.youtube_publish_at = part_state["publish_at"]
             result.youtube_schedule_reason = part_state["schedule_reason"]
+            part_state["last_stage"] = "upload_persisted"
+            state["last_stage"] = f"part_{part_index}_upload_persisted"
+            state["last_error"] = ""
+            state_ref = save_split_processing_state(book_record, state)
+            result.state_path = state_ref
 
         part_state["status"] = "completed"
         part_state["completed_at"] = dt_module.datetime.now().isoformat()
