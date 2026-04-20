@@ -3505,6 +3505,7 @@ try:
 except Exception:
     YOUTUBE_SCHEDULE_LOCAL_TIMEZONE = dt_timezone(dt_timedelta(hours=8))
 YOUTUBE_DAILY_PUBLISH_LIMIT = max(1, int(globals().get("YOUTUBE_DAILY_PUBLISH_LIMIT", 3) or 3))
+YOUTUBE_TITLE_MATCH_CACHE = {}
 
 def authenticate_youtube_from_supabase(channel_name):
     """从数据库获取指定频道的 YouTube Token，并在需要时自动刷新。"""
@@ -3726,6 +3727,11 @@ def _chunk_items(items, chunk_size):
         yield items[idx:idx + chunk_size]
 
 
+def _normalize_youtube_title_key(title):
+    text = " ".join(str(title or "").split()).strip()
+    return text.casefold()
+
+
 def _fetch_video_status_rows_with_client(youtube, video_ids):
     rows = []
     for chunk in _chunk_items(video_ids, 50):
@@ -3752,6 +3758,86 @@ def _get_future_scheduled_publish_at_utc(video_row, now_utc):
     if status_publish_at is not None and status_publish_at > now_utc:
         return status_publish_at
     return None
+
+
+def _build_existing_video_match_from_row(video_row):
+    if not isinstance(video_row, dict):
+        return {}
+
+    video_id = str(video_row.get("id") or "").strip()
+    title = str(((video_row.get("snippet") or {}).get("title") or "")).strip()
+    if not video_id or not title:
+        return {}
+
+    uploaded_at = _format_youtube_datetime_z((video_row.get("snippet") or {}).get("publishedAt"))
+    publish_at = _format_youtube_datetime_z((video_row.get("status") or {}).get("publishAt"))
+    return {
+        "video_id": video_id,
+        "youtube_url": f"https://youtu.be/{video_id}",
+        "uploaded_at": uploaded_at,
+        "publish_at": publish_at,
+        "schedule_reason": "existing_title_match",
+        "title": title,
+    }
+
+
+def _build_channel_video_title_index_with_client(youtube):
+    uploads_playlist_id = _get_youtube_uploads_playlist_id_with_client(youtube)
+    video_ids = _list_upload_video_ids_with_client(youtube, uploads_playlist_id)
+    rows = _fetch_video_status_rows_with_client(youtube, video_ids)
+
+    title_index = {}
+    for row in rows:
+        match = _build_existing_video_match_from_row(row)
+        if not match:
+            continue
+        title_key = _normalize_youtube_title_key(match.get("title"))
+        if not title_key:
+            continue
+
+        previous = title_index.get(title_key)
+        current_uploaded = _parse_youtube_datetime(match.get("uploaded_at")) or dt_datetime.min.replace(tzinfo=dt_timezone.utc)
+        previous_uploaded = _parse_youtube_datetime(previous.get("uploaded_at")) if previous else None
+        previous_uploaded = previous_uploaded or dt_datetime.min.replace(tzinfo=dt_timezone.utc)
+        if previous is None or current_uploaded >= previous_uploaded:
+            title_index[title_key] = match
+    return title_index
+
+
+def _get_channel_video_title_index(channel_name, force_refresh=False):
+    normalized_channel = str(channel_name or "").strip()
+    if not normalized_channel:
+        return {}
+
+    if force_refresh or normalized_channel not in YOUTUBE_TITLE_MATCH_CACHE:
+        youtube = authenticate_youtube_from_supabase(normalized_channel)
+        if not youtube:
+            return {}
+        YOUTUBE_TITLE_MATCH_CACHE[normalized_channel] = _build_channel_video_title_index_with_client(youtube)
+
+    return YOUTUBE_TITLE_MATCH_CACHE.get(normalized_channel, {})
+
+
+def find_existing_channel_video_by_exact_title(channel_name, title, force_refresh=False):
+    normalized_title = str(title or "").strip()[:100]
+    title_key = _normalize_youtube_title_key(normalized_title)
+    if not title_key:
+        return {}
+
+    title_index = _get_channel_video_title_index(channel_name, force_refresh=force_refresh)
+    match = title_index.get(title_key, {})
+    return dict(match) if isinstance(match, dict) else {}
+
+
+def remember_existing_channel_video_title_match(channel_name, title, match):
+    normalized_channel = str(channel_name or "").strip()
+    normalized_title = str(title or "").strip()[:100]
+    title_key = _normalize_youtube_title_key(normalized_title)
+    if not normalized_channel or not title_key or not isinstance(match, dict):
+        return
+
+    cache_bucket = YOUTUBE_TITLE_MATCH_CACHE.setdefault(normalized_channel, {})
+    cache_bucket[title_key] = dict(match)
 
 
 def _collect_channel_publish_schedule_facts_with_client(youtube, now_utc):
@@ -4073,12 +4159,18 @@ def upload_to_youtube_detailed(
         return False
 
     try:
+        existing_match = find_existing_channel_video_by_exact_title(channel_name, title)
+        if existing_match:
+            log.info("检测到频道内已存在同标题视频，直接复用并跳过上传：%s", str(title or "").strip()[:100])
+            remember_existing_channel_video_title_match(channel_name, title, existing_match)
+            return existing_match
+
         resolved_schedule = resolve_youtube_publish_schedule_with_client(
             youtube,
             privacy_status=privacy_status,
             schedule_after_hours=schedule_after_hours,
         )
-        return _upload_to_youtube_with_client(
+        upload_result = _upload_to_youtube_with_client(
             youtube=youtube,
             video_path=video_path,
             title=title,
@@ -4091,6 +4183,9 @@ def upload_to_youtube_detailed(
             publish_at=resolved_schedule.get("publish_at", ""),
             schedule_reason=resolved_schedule.get("schedule_reason", ""),
         )
+        if upload_result:
+            remember_existing_channel_video_title_match(channel_name, title, upload_result)
+        return upload_result
     except Exception as e:
         log.error("❌ 主力信封管线在传输时遭受强击崩溃: %s", e)
         return False
@@ -5228,6 +5323,42 @@ def process_split_part(result, state, state_ref, split_plan, part_plan, book_rec
         log.info("[%s] 分片 %d/%d 已完成，跳过重做。", book_name, part_index, part_count)
         return build_part_result_record(part_plan, part_state)
 
+    precomputed_upload_title = ""
+    precomputed_upload_desc = ""
+    precomputed_upload_tags = ""
+    if ENABLE_YOUTUBE_UPLOAD and YOUTUBE_CHANNEL_NAME.strip():
+        precomputed_upload_title, precomputed_upload_desc, precomputed_upload_tags = build_youtube_payload(
+            result,
+            book_name,
+            category,
+            youtube_chapters="",
+            title_prefix=f"{part_index}-" if part_count > 1 else "",
+            part_hint="",
+            include_youtube_chapters=False,
+            include_part_hint=False,
+        )
+        if not FORCE_REPROCESS:
+            existing_channel_match = find_existing_channel_video_by_exact_title(
+                str(YOUTUBE_CHANNEL_NAME).strip(),
+                precomputed_upload_title,
+            )
+            if existing_channel_match:
+                part_state["youtube_title"] = str(existing_channel_match.get("title") or precomputed_upload_title or "")
+                part_state["youtube_url"] = str(existing_channel_match.get("youtube_url") or "")
+                part_state["video_id"] = str(existing_channel_match.get("video_id") or "")
+                part_state["uploaded_at"] = str(existing_channel_match.get("uploaded_at") or "")
+                part_state["publish_at"] = str(existing_channel_match.get("publish_at") or "")
+                part_state["schedule_reason"] = str(existing_channel_match.get("schedule_reason") or "existing_title_match")
+                part_state["last_stage"] = "existing_title_match"
+                state["last_stage"] = f"part_{part_index}_existing_title_match"
+                state["last_error"] = ""
+                state_ref = save_split_processing_state(book_record, state)
+                result.state_path = state_ref
+                result.youtube_publish_at = part_state["publish_at"]
+                result.youtube_schedule_reason = part_state["schedule_reason"]
+                log.info("[%s] 分片 %d/%d 命中频道内同标题视频，直接复用并跳过重复处理。", book_name, part_index, part_count)
+                return build_part_result_record(part_plan, part_state)
+
     chapter_items = part_plan.get("items", [])
     chapters_only = [item["chapter"] for item in chapter_items]
     chapters_dir = os.path.join(part_dir, "chapters")
@@ -5309,16 +5440,20 @@ def process_split_part(result, state, state_ref, split_plan, part_plan, book_rec
             if not part_state.get("video_path") or not os.path.exists(part_state["video_path"]):
                 raise RuntimeError("缺少可上传的视频分片")
 
-            final_title, final_desc, final_tags = build_youtube_payload(
-                result,
-                book_name,
-                category,
-                youtube_chapters="",
-                title_prefix=f"{part_index}-" if part_count > 1 else "",
-                part_hint="",
-                include_youtube_chapters=False,
-                include_part_hint=False,
-            )
+            final_title = precomputed_upload_title
+            final_desc = precomputed_upload_desc
+            final_tags = precomputed_upload_tags
+            if not final_title:
+                final_title, final_desc, final_tags = build_youtube_payload(
+                    result,
+                    book_name,
+                    category,
+                    youtube_chapters="",
+                    title_prefix=f"{part_index}-" if part_count > 1 else "",
+                    part_hint="",
+                    include_youtube_chapters=False,
+                    include_part_hint=False,
+                )
             upload_result = {}
             if not FORCE_REPROCESS:
                 upload_result = load_youtube_upload_receipt(
