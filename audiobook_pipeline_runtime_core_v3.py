@@ -5881,6 +5881,25 @@ def process_split_book(result, book_record, book_data, chapters_sorted, book_dir
                 sync_split_playlist(result, state, split_plan, book_record, book_name)
                 state = load_split_processing_state(book_record) or state
                 sync_result_from_split_state(result, state, split_plan)
+                if not bool(getattr(result, "playlist_completed", False)):
+                    playlist_state = get_split_playlist_state(state)
+                    incomplete_error = (
+                        "Playlist sync returned without completion: "
+                        f"playlist_id={str(playlist_state.get('playlist_id') or '')} "
+                        f"playlist_status={str(playlist_state.get('status') or '')} "
+                        f"playlist_url={str(playlist_state.get('playlist_url') or '')} "
+                        f"ordered_video_ids={[item.get('video_id') for item in build_ordered_split_video_records(state, split_plan)]}"
+                    )
+                    playlist_state["status"] = "failed"
+                    playlist_state["last_error"] = incomplete_error
+                    state["pending_resume"] = True
+                    state["last_stage"] = "playlist_failed"
+                    state["last_error"] = incomplete_error
+                    state_ref = save_split_processing_state(book_record, state)
+                    result.state_path = state_ref
+                    result.pending_resume = True
+                    result.error = incomplete_error
+                    return result
             except Exception as e:
                 playlist_state = get_split_playlist_state(state)
                 playlist_state["status"] = "failed"
@@ -5901,8 +5920,21 @@ def process_split_book(result, book_record, book_data, chapters_sorted, book_dir
         result.state_path = state_ref
         state = load_split_processing_state(book_record) or state
         sync_result_from_split_state(result, state, split_plan)
-        result.pending_resume = False
-        result.error = ""
+        result.pending_resume = not (
+            result.completed_part_count >= result.part_count
+            and (not playlist_required or bool(getattr(result, "playlist_completed", False)))
+        )
+        if not result.pending_resume:
+            result.error = ""
+        elif not result.error:
+            playlist_state = get_split_playlist_state(state)
+            result.error = (
+                "Split book reached final checkpoint but is still incomplete: "
+                f"playlist_id={str(playlist_state.get('playlist_id') or '')} "
+                f"playlist_status={str(playlist_state.get('status') or '')} "
+                f"playlist_url={str(playlist_state.get('playlist_url') or '')} "
+                f"completed_part_count={result.completed_part_count}/{result.part_count}"
+            )
     elif not result.error:
         result.error = "长音频分片处理中断，已记录进度，等待下次续跑"
 
