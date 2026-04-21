@@ -1909,9 +1909,9 @@ def _save_split_processing_state_raw(book_record, state):
     state["book_name"] = book_record.get("book_name") or state.get("book_name", "")
     state["category"] = book_record.get("category") or state.get("category", "")
     state["created_at"] = state.get("created_at") or now
+    # Keep the in-memory nested dict/list objects stable so any existing
+    # `part_state` / `playlist_state` references remain valid after a save.
     state_json_payload = make_json_compatible(state)
-    state.clear()
-    state.update(state_json_payload)
 
     try:
         execute_postgres(
@@ -1958,7 +1958,7 @@ def _save_split_processing_state_raw(book_record, state):
                 int(state.get("part_count") or 1),
                 state["updated_at"],
                 state["created_at"],
-                Jsonb(state),
+                Jsonb(state_json_payload),
             ),
         )
     except Exception as e:
