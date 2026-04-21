@@ -3970,7 +3970,7 @@ def _get_youtube_uploads_playlist_id_with_client(youtube):
     return uploads_playlist_id
 
 
-def _list_upload_video_ids_with_client(youtube, uploads_playlist_id):
+def _list_upload_video_ids_with_client(youtube, uploads_playlist_id, max_videos=100):
     video_ids = []
     page_token = None
     while True:
@@ -3984,6 +3984,8 @@ def _list_upload_video_ids_with_client(youtube, uploads_playlist_id):
             video_id = str(((item.get("contentDetails") or {}).get("videoId") or "")).strip()
             if video_id:
                 video_ids.append(video_id)
+                if len(video_ids) >= max(1, int(max_videos or 100)):
+                    return video_ids[: max(1, int(max_videos or 100))]
         page_token = response.get("nextPageToken")
         if not page_token:
             break
