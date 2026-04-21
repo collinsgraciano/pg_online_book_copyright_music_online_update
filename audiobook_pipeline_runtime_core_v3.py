@@ -497,6 +497,7 @@ import logging
 import subprocess
 import tempfile
 import hashlib
+import traceback
 import requests
 import concurrent.futures
 from pathlib import Path
@@ -1825,7 +1826,7 @@ def load_split_processing_state(book_record):
         raise RuntimeError(f"从数据库读取断点状态失败，请检查表 {table_name}: {e}")
 
 
-def save_split_processing_state(book_record, state):
+def _save_split_processing_state_raw(book_record, state):
     now = dt_module.datetime.now().isoformat()
     parts = state.get("parts", [])
     progress = evaluate_split_completion_state(state)
@@ -1911,6 +1912,76 @@ def save_split_processing_state(book_record, state):
         raise RuntimeError(f"写入数据库断点状态失败，请检查表 {table_name}: {e}")
 
     return state_ref
+
+
+def _truncate_split_state_debug_value(value, limit=240):
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...<truncated>"
+
+
+def _build_split_state_debug_payload(book_record, state):
+    safe_state = state if isinstance(state, dict) else {}
+    safe_book = book_record if isinstance(book_record, dict) else {}
+    progress = evaluate_split_completion_state(safe_state)
+    playlist_state = get_split_playlist_state(safe_state) if safe_state.get("mode") == "split_upload" else {}
+
+    parts_summary = []
+    for item in safe_state.get("parts", []) or []:
+        if not isinstance(item, dict):
+            continue
+        audio_path = str(item.get("audio_path") or "").strip()
+        video_path = str(item.get("video_path") or "").strip()
+        parts_summary.append(
+            {
+                "part_index": item.get("part_index"),
+                "status": str(item.get("status") or ""),
+                "last_stage": str(item.get("last_stage") or ""),
+                "error": _truncate_split_state_debug_value(item.get("error")),
+                "has_audio_path": bool(audio_path),
+                "has_video_path": bool(video_path),
+                "has_video_id": bool(str(item.get("video_id") or "").strip()),
+                "has_youtube_url": bool(str(item.get("youtube_url") or "").strip()),
+                "audio_file": os.path.basename(audio_path) if audio_path else "",
+                "video_file": os.path.basename(video_path) if video_path else "",
+                "youtube_title": _truncate_split_state_debug_value(item.get("youtube_title"), limit=120),
+            }
+        )
+
+    payload = {
+        "book_id": str(safe_book.get("book_id") or safe_state.get("book_id") or "").strip(),
+        "project_flag": str(PROJECT_FLAG or "").strip(),
+        "book_name": str(safe_book.get("book_name") or safe_state.get("book_name") or "").strip(),
+        "category": str(safe_book.get("category") or safe_state.get("category") or "").strip(),
+        "state_table": str(get_book_state_table_name() or "").strip(),
+        "state_status": str(safe_state.get("status") or ""),
+        "pending_resume": bool(safe_state.get("pending_resume")),
+        "last_stage": str(safe_state.get("last_stage") or ""),
+        "last_error": _truncate_split_state_debug_value(safe_state.get("last_error")),
+        "current_part_index": safe_state.get("current_part_index"),
+        "completed_part_count": progress["completed_part_count"],
+        "part_count": progress["part_count"],
+        "playlist_required": progress["playlist_required"],
+        "playlist_completed": progress["playlist_completed"],
+        "playlist_status": str(playlist_state.get("status") or ""),
+        "playlist_id": _truncate_split_state_debug_value(playlist_state.get("playlist_id"), limit=80),
+        "playlist_url": _truncate_split_state_debug_value(playlist_state.get("playlist_url"), limit=120),
+        "parts": parts_summary,
+    }
+    return make_json_compatible(payload)
+
+
+def save_split_processing_state(book_record, state):
+    try:
+        return _save_split_processing_state_raw(book_record, state)
+    except Exception as e:
+        debug_payload = _build_split_state_debug_payload(book_record, state)
+        debug_text = json.dumps(debug_payload, ensure_ascii=False, sort_keys=True)
+        book_label = debug_payload.get("book_name") or debug_payload.get("book_id") or "unknown-book"
+        log.error("[%s] 保存续跑状态失败，调试详情: %s", book_label, debug_text)
+        log.error("[%s] 保存续跑状态异常堆栈: %s", book_label, traceback.format_exc())
+        raise RuntimeError(f"保存续跑状态失败，调试详情: {debug_text} | 原始异常: {e}") from e
 
 
 def delete_split_processing_state(book_record, only_if_completed=False):
