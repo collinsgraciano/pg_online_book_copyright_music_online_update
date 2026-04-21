@@ -3171,8 +3171,10 @@ from PIL import Image
 from io import BytesIO
 
 
-def normalize_modelscope_token_pool(token_value):
-    if isinstance(token_value, (list, tuple, set)):
+def normalize_modelscope_token_pool(token_value, preserve_list_reference=False):
+    if isinstance(token_value, list) and preserve_list_reference:
+        raw_items = token_value
+    elif isinstance(token_value, (list, tuple, set)):
         raw_items = list(token_value)
     else:
         raw_items = str(token_value or "").split(",")
@@ -3185,7 +3187,38 @@ def normalize_modelscope_token_pool(token_value):
             continue
         normalized.append(text)
         seen.add(text)
+
+    if isinstance(token_value, list) and preserve_list_reference:
+        token_value[:] = normalized
+        return token_value
     return normalized
+
+
+def build_modelscope_token_pool(token_value, shuffle_once=False):
+    normalized_tokens = normalize_modelscope_token_pool(token_value)
+    if shuffle_once and len(normalized_tokens) > 1:
+        random.shuffle(normalized_tokens)
+    return normalized_tokens
+
+
+def _get_modelscope_active_tokens(token_pool):
+    if isinstance(token_pool, list):
+        return normalize_modelscope_token_pool(token_pool, preserve_list_reference=True)
+    return normalize_modelscope_token_pool(token_pool)
+
+
+def _remove_modelscope_token_from_pool(token_pool, token_text):
+    if not isinstance(token_pool, list):
+        return False
+    normalized_pool = normalize_modelscope_token_pool(token_pool, preserve_list_reference=True)
+    token_value = str(token_text or "").strip()
+    if not token_value:
+        return False
+    removed = False
+    while token_value in normalized_pool:
+        normalized_pool.remove(token_value)
+        removed = True
+    return removed
 
 
 def is_modelscope_daily_quota_exceeded_error(error):
@@ -3302,7 +3335,7 @@ def _sleep_before_next_modelscope_token():
 
 
 def _run_qwen_task_with_token_rotation(task_label, token_pool, attempt, runner, max_quota_rounds=2):
-    active_tokens = normalize_modelscope_token_pool(token_pool)
+    active_tokens = _get_modelscope_active_tokens(token_pool)
     if not active_tokens:
         raise ValueError(f"{task_label} 未提供可用的 ModelScope Token。")
 
@@ -3310,14 +3343,20 @@ def _run_qwen_task_with_token_rotation(task_label, token_pool, attempt, runner, 
     last_quota_error = None
 
     for quota_round in range(1, max_quota_rounds + 1):
+        active_tokens = _get_modelscope_active_tokens(token_pool)
+        if not active_tokens:
+            break
         quota_hit_this_round = False
+        round_tokens = list(active_tokens)
 
-        for token_index, current_token in enumerate(active_tokens, start=1):
+        for token_index, current_token in enumerate(round_tokens, start=1):
             try:
                 return runner(current_token), collected_errors
             except Exception as e:
-                has_next_token = token_index < len(active_tokens)
-                if is_modelscope_daily_quota_exceeded_error(e):
+                if is_modelscope_http_429_error(e):
+                    _remove_modelscope_token_from_pool(token_pool, current_token)
+                    active_tokens = _get_modelscope_active_tokens(token_pool)
+                    has_next_token = bool(active_tokens)
                     quota_hit_this_round = True
                     last_quota_error = e
                     log.warning(
@@ -3335,6 +3374,7 @@ def _run_qwen_task_with_token_rotation(task_label, token_pool, attempt, runner, 
                     continue
 
                 collected_errors.append(str(e))
+                has_next_token = token_index < len(round_tokens)
                 log.warning(
                     "⚠️ %s 第 %d 次失败：%s；准备切换下一个 token。",
                     task_label,
@@ -3346,6 +3386,8 @@ def _run_qwen_task_with_token_rotation(task_label, token_pool, attempt, runner, 
 
         if not quota_hit_this_round:
             return None, collected_errors
+        if not _get_modelscope_active_tokens(token_pool):
+            break
         if quota_round < max_quota_rounds:
             _sleep_before_next_modelscope_token()
 
@@ -3464,12 +3506,20 @@ def _request_modelscope_cover_image_url(image_model, current_token, draw_prompt,
 
 
 def _try_generate_cover_with_image_model(output_path, draw_prompt, img_size, image_model, token_candidates):
-    active_tokens = normalize_modelscope_token_pool(token_candidates)
+    active_tokens = _get_modelscope_active_tokens(token_candidates)
+    if not active_tokens:
+        return {
+            "success": False,
+            "errors": ["当前已没有可用的 ModelScope Token。"],
+            "failure_count": 0,
+            "all_failures_are_429": True,
+        }
     failure_messages = []
     failure_count = 0
     http_429_count = 0
 
-    for token_index, current_token in enumerate(active_tokens, start=1):
+    round_tokens = list(active_tokens)
+    for token_index, current_token in enumerate(round_tokens, start=1):
         try:
             img_url = _request_modelscope_cover_image_url(image_model, current_token, draw_prompt, img_size)
             if download_file(img_url, output_path):
@@ -3495,8 +3545,10 @@ def _try_generate_cover_with_image_model(output_path, draw_prompt, img_size, ima
 
             failure_count += 1
             failure_messages.append(str(e))
-            has_next_token = token_index < len(active_tokens)
             if is_modelscope_http_429_error(e):
+                _remove_modelscope_token_from_pool(token_candidates, current_token)
+                active_tokens = _get_modelscope_active_tokens(token_candidates)
+                has_next_token = bool(active_tokens)
                 http_429_count += 1
                 log.warning(
                     "⚠️ %s 第 %d 个 token 生图失败：命中 429/限流，准备切换下一个 token。原始错误：%s",
@@ -3508,6 +3560,7 @@ def _try_generate_cover_with_image_model(output_path, draw_prompt, img_size, ima
                     _sleep_before_next_modelscope_token()
                 continue
 
+            has_next_token = token_index < len(round_tokens)
             log.warning(
                 "⚠️ %s 第 %d 个 token 生图失败：%s；准备切换下一个 token。",
                 image_model,
@@ -3526,7 +3579,7 @@ def _try_generate_cover_with_image_model(output_path, draw_prompt, img_size, ima
 
 
 def auto_create_youtube_cover(book_name, book_desc, output_path, token, resolution="1080p"):
-    token_pool = normalize_modelscope_token_pool(token)
+    token_pool = _get_modelscope_active_tokens(token)
     if not token_pool:
         raise ValueError("未提供 ModelScope Token，无法生成 AI 海报。")
 
@@ -3617,7 +3670,7 @@ def auto_create_youtube_cover(book_name, book_desc, output_path, token, resoluti
 
 
 def auto_create_youtube_seo(book_name, book_desc, output_path, token):
-    token_pool = normalize_modelscope_token_pool(token)
+    token_pool = _get_modelscope_active_tokens(token)
     if not token_pool:
         raise ValueError("未提供 ModelScope Token，无法生成 SEO 文案。")
 
@@ -4979,7 +5032,7 @@ def prepare_book_cover_and_seo(result, book_data, book_dir, safe_name, book_name
     token_pool = []
     if needs_modelscope_token:
         resolved_modelscope_token = resolve_modelscope_token(str(YOUTUBE_CHANNEL_NAME).strip())
-        token_pool = [t.strip() for t in str(resolved_modelscope_token).split(",") if t.strip()]
+        token_pool = build_modelscope_token_pool(resolved_modelscope_token, shuffle_once=True)
         if not token_pool:
             raise RuntimeError("未能解析出可用的 ModelScope Token，无法继续 AI 生成。")
 
