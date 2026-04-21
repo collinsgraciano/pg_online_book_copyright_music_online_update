@@ -1972,9 +1972,96 @@ def _build_split_state_debug_payload(book_record, state):
     return make_json_compatible(payload)
 
 
+def _maybe_log_split_state_persisted(book_record, state, state_ref):
+    if not isinstance(state, dict):
+        return
+
+    last_stage = str(state.get("last_stage") or "").strip()
+    if not last_stage:
+        return
+
+    book_name = str(book_record.get("book_name") or state.get("book_name") or state.get("book_id") or "unknown-book").strip()
+    progress = evaluate_split_completion_state(state)
+    part_count = max(1, int(progress.get("part_count") or 1))
+    completed_part_count = max(0, int(progress.get("completed_part_count") or 0))
+    last_error = _truncate_split_state_debug_value(state.get("last_error"), limit=160)
+
+    match = re.fullmatch(r"part_(\d+)_(.+)", last_stage)
+    if match:
+        part_index = int(match.group(1))
+        suffix = match.group(2)
+
+        if suffix == "upload_persisted":
+            log.info(
+                "[%s] 分片 %d/%d 的上传回执已写入数据库续跑状态（进度 %d/%d，state=%s）",
+                book_name,
+                part_index,
+                part_count,
+                completed_part_count,
+                part_count,
+                state_ref,
+            )
+            return
+
+        if suffix == "completed":
+            log.info(
+                "[%s] 分片 %d/%d 已处理完成，当前状态已写入数据库（进度 %d/%d，state=%s）",
+                book_name,
+                part_index,
+                part_count,
+                completed_part_count,
+                part_count,
+                state_ref,
+            )
+            return
+
+        if suffix == "failed":
+            log.warning(
+                "[%s] 分片 %d/%d 的失败状态已写入数据库（进度 %d/%d，state=%s，error=%s）",
+                book_name,
+                part_index,
+                part_count,
+                completed_part_count,
+                part_count,
+                state_ref,
+                last_error,
+            )
+            return
+
+    if last_stage == "playlist_completed":
+        log.info(
+            "[%s] 播放列表完成状态已写入数据库（进度 %d/%d，state=%s）",
+            book_name,
+            completed_part_count,
+            part_count,
+            state_ref,
+        )
+        return
+
+    if last_stage == "playlist_failed":
+        log.warning(
+            "[%s] 播放列表失败状态已写入数据库（进度 %d/%d，state=%s，error=%s）",
+            book_name,
+            completed_part_count,
+            part_count,
+            state_ref,
+            last_error,
+        )
+        return
+
+    if last_stage == "all_parts_completed":
+        log.info(
+            "[%s] 多 P 最终完成状态已写入数据库（进度 %d/%d，state=%s）",
+            book_name,
+            completed_part_count,
+            part_count,
+            state_ref,
+        )
+
+
 def save_split_processing_state(book_record, state):
     try:
-        return _save_split_processing_state_raw(book_record, state)
+        state_ref = _save_split_processing_state_raw(book_record, state)
     except Exception as e:
         debug_payload = _build_split_state_debug_payload(book_record, state)
         debug_text = json.dumps(debug_payload, ensure_ascii=False, sort_keys=True)
@@ -1982,6 +2069,8 @@ def save_split_processing_state(book_record, state):
         log.error("[%s] 保存续跑状态失败，调试详情: %s", book_label, debug_text)
         log.error("[%s] 保存续跑状态异常堆栈: %s", book_label, traceback.format_exc())
         raise RuntimeError(f"保存续跑状态失败，调试详情: {debug_text} | 原始异常: {e}") from e
+    _maybe_log_split_state_persisted(book_record, state, state_ref)
+    return state_ref
 
 
 def delete_split_processing_state(book_record, only_if_completed=False):
