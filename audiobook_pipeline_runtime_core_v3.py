@@ -1675,6 +1675,10 @@ def _split_part_has_uploaded_video(part_state):
     return bool(str(part_state.get("video_id") or "").strip() or str(part_state.get("youtube_url") or "").strip())
 
 
+def _is_split_playlist_required(part_count):
+    return bool(int(part_count or 0) > 1 and ENABLE_YOUTUBE_UPLOAD and str(YOUTUBE_CHANNEL_NAME or "").strip())
+
+
 def _split_part_is_completed(part_state):
     if not isinstance(part_state, dict):
         return False
@@ -1709,6 +1713,39 @@ def _reconcile_split_part_state(part_state):
         part_state["error"] = ""
         changed = True
     return changed
+
+
+def evaluate_split_completion_state(state):
+    if not isinstance(state, dict):
+        state = {}
+
+    parts = state.get("parts", [])
+    if not isinstance(parts, list):
+        parts = []
+
+    for item in parts:
+        _reconcile_split_part_state(item)
+
+    part_count = max(1, int(state.get("part_count") or len(parts) or 1))
+    completed_part_count = sum(1 for item in parts if _split_part_is_completed(item))
+    playlist_state = get_split_playlist_state(state) if state.get("mode") == "split_upload" else {}
+    playlist_required = bool(state.get("mode") == "split_upload" and _is_split_playlist_required(part_count))
+    playlist_completed = (
+        not playlist_required
+        or (
+            bool(str(playlist_state.get("playlist_id") or "").strip())
+            and str(playlist_state.get("status") or "").strip().lower() == "completed"
+        )
+    )
+
+    return {
+        "part_count": part_count,
+        "completed_part_count": completed_part_count,
+        "all_parts_completed": completed_part_count >= part_count,
+        "playlist_required": playlist_required,
+        "playlist_completed": playlist_completed,
+        "fully_completed": completed_part_count >= part_count and playlist_completed,
+    }
 
 
 def normalize_split_state_from_row(row):
@@ -1791,33 +1828,15 @@ def load_split_processing_state(book_record):
 def save_split_processing_state(book_record, state):
     now = dt_module.datetime.now().isoformat()
     parts = state.get("parts", [])
-    for item in parts:
-        _reconcile_split_part_state(item)
-
-    completed_count = sum(1 for item in parts if _split_part_is_completed(item))
+    progress = evaluate_split_completion_state(state)
+    completed_count = progress["completed_part_count"]
     state["completed_part_count"] = completed_count
-    state["part_count"] = max(1, int(state.get("part_count") or len(parts) or 1))
+    state["part_count"] = progress["part_count"]
     pending_parts = [item.get("part_index") for item in parts if not _split_part_is_completed(item)]
     state["current_part_index"] = pending_parts[0] if pending_parts else None
     state["updated_at"] = now
 
-    all_parts_completed = completed_count >= state["part_count"]
-    playlist_state = get_split_playlist_state(state) if state.get("mode") == "split_upload" else {}
-    playlist_required = bool(
-        state.get("mode") == "split_upload"
-        and state["part_count"] > 1
-        and ENABLE_YOUTUBE_UPLOAD
-        and str(YOUTUBE_CHANNEL_NAME or "").strip()
-    )
-    playlist_completed = (
-        not playlist_required
-        or (
-            bool(playlist_state.get("playlist_id"))
-            and str(playlist_state.get("status") or "").strip().lower() == "completed"
-        )
-    )
-
-    if all_parts_completed and playlist_completed:
+    if progress["fully_completed"]:
         state["status"] = "completed"
         state["pending_resume"] = False
         state["completed_at"] = state.get("completed_at") or now
@@ -2103,13 +2122,26 @@ def get_split_part_state(state, part_index):
     return None
 
 
-def list_interrupted_book_states():
+def _book_has_project_status(book_record_or_status, project_flag=None):
+    flag = str(PROJECT_FLAG if project_flag is None else project_flag).strip()
+    if not flag:
+        return False
+
+    status_value = book_record_or_status
+    if isinstance(book_record_or_status, dict):
+        status_value = book_record_or_status.get("status")
+
+    return flag in set(normalize_text_items(status_value))
+
+
+def list_interrupted_book_states(book_rows_by_id=None):
     states = {}
     table_name = get_book_state_table_name()
     table_sql = get_public_table_identifier(table_name)
     project_flag = str(PROJECT_FLAG or "").strip()
     page_size = 100
     offset = 0
+    book_rows_by_id = book_rows_by_id if isinstance(book_rows_by_id, dict) else {}
 
     while True:
         try:
@@ -2129,10 +2161,10 @@ def list_interrupted_book_states():
                   created_at,
                   state_json
                 FROM {}
-                WHERE project_flag = %s AND pending_resume = %s
+                WHERE project_flag = %s
                 """
             ).format(table_sql)
-            params = [project_flag, True]
+            params = [project_flag]
             if TARGET_CATEGORY.strip():
                 statement += sql.SQL(" AND category = %s")
                 params.append(TARGET_CATEGORY.strip())
@@ -2150,11 +2182,39 @@ def list_interrupted_book_states():
             state = normalize_split_state_from_row(row)
             if state.get("mode") != "split_upload":
                 continue
-            if state.get("status") == "completed":
-                continue
 
             book_id = str(state.get("book_id") or "").strip()
             if not book_id:
+                continue
+
+            progress = evaluate_split_completion_state(state)
+            state["completed_part_count"] = progress["completed_part_count"]
+            state["part_count"] = progress["part_count"]
+            state["status"] = "completed" if progress["fully_completed"] else "in_progress"
+            state["pending_resume"] = not progress["fully_completed"]
+
+            book_record = book_rows_by_id.get(book_id, {})
+            already_processed = _book_has_project_status(book_record, project_flag=project_flag)
+            if already_processed and progress["fully_completed"]:
+                try:
+                    if delete_split_processing_state({"book_id": book_id}, only_if_completed=False):
+                        log.info(
+                            "[%s] 检测到 books.status 已包含当前频道，已补删残留的 book_processing_states。",
+                            state.get("book_name") or book_id,
+                        )
+                except Exception as delete_error:
+                    log.warning(
+                        "[%s] books.status 已标记成功，但补删残留 book_processing_states 失败: %s",
+                        state.get("book_name") or book_id,
+                        delete_error,
+                    )
+                continue
+
+            if already_processed:
+                log.warning(
+                    "[%s] books.status 已包含当前频道，但残留多 P 状态未完成；本次启动将忽略这条残留状态。",
+                    state.get("book_name") or book_id,
+                )
                 continue
 
             existing = states.get(book_id)
@@ -2172,16 +2232,27 @@ def finalize_book_result(result, book_dir, book_record=None):
     part_count = max(1, int(getattr(result, "part_count", 1) or 1))
     completed_part_count = max(0, int(getattr(result, "completed_part_count", 0) or 0))
 
-    if part_count > 1:
-        result.audio_ready = completed_part_count >= part_count
-        result.video_ready = completed_part_count >= part_count if ENABLE_VIDEO_GENERATION else result.audio_ready
-        result.upload_ready = completed_part_count >= part_count if ENABLE_YOUTUBE_UPLOAD else result.video_ready
+    if getattr(result, "split_mode", False) or part_count > 1:
+        playlist_required = bool(getattr(result, "playlist_required", False))
+        playlist_completed = not playlist_required or bool(getattr(result, "playlist_completed", False))
+        all_parts_completed = completed_part_count >= part_count
+
+        result.audio_ready = all_parts_completed
+        result.video_ready = all_parts_completed if ENABLE_VIDEO_GENERATION else result.audio_ready
+        result.upload_ready = (
+            all_parts_completed and (not playlist_required or playlist_completed)
+            if ENABLE_YOUTUBE_UPLOAD
+            else result.video_ready
+        )
+        result.pending_resume = bool(getattr(result, "pending_resume", False)) or not all_parts_completed or (
+            playlist_required and not playlist_completed
+        )
         required_stages = [result.audio_ready]
         if ENABLE_VIDEO_GENERATION:
             required_stages.append(result.video_ready)
         if ENABLE_YOUTUBE_UPLOAD:
             required_stages.append(result.upload_ready)
-        result.success = all(required_stages) and not bool(getattr(result, "pending_resume", False))
+        result.success = all(required_stages) and all_parts_completed and playlist_completed and not result.pending_resume
     else:
         result.audio_ready = bool(result.merged_audio_path and os.path.exists(result.merged_audio_path))
         result.video_ready = bool(result.video_path and os.path.exists(result.video_path))
@@ -4508,6 +4579,8 @@ class BookResult:
     part_results: list = field(default_factory=list)
     part_count: int = 1
     completed_part_count: int = 0
+    playlist_required: bool = False
+    playlist_completed: bool = False
     estimated_total_duration_seconds: int = 0
     split_mode: bool = False
     pending_resume: bool = False
@@ -5221,8 +5294,9 @@ def sync_result_from_split_state(result, state, split_plan):
     result.playlist_id = str(playlist_state.get("playlist_id") or "")
     result.playlist_url = str(playlist_state.get("playlist_url") or "")
     result.playlist_title = str(playlist_state.get("title") or "")
-    playlist_required = bool(result.part_count > 1 and ENABLE_YOUTUBE_UPLOAD and str(YOUTUBE_CHANNEL_NAME or "").strip())
-    playlist_completed = bool(result.playlist_id) and str(playlist_state.get("status") or "").strip().lower() == "completed"
+    progress = evaluate_split_completion_state(state)
+    playlist_required = progress["playlist_required"]
+    playlist_completed = progress["playlist_completed"]
 
     latest_audio_path = ""
     latest_video_path = ""
@@ -5261,8 +5335,10 @@ def sync_result_from_split_state(result, state, split_plan):
 
     result.merged_audio_path = latest_audio_path
     result.video_path = latest_video_path
-    result.completed_part_count = completed_part_count
-    result.pending_resume = completed_part_count < result.part_count or (playlist_required and not playlist_completed)
+    result.completed_part_count = progress["completed_part_count"]
+    result.playlist_required = playlist_required
+    result.playlist_completed = playlist_completed
+    result.pending_resume = not progress["fully_completed"]
     result.youtube_url = "\n".join(result.youtube_urls)
     result.youtube_publish_at = latest_publish_at
     result.youtube_schedule_reason = latest_schedule_reason
@@ -5271,15 +5347,12 @@ def sync_result_from_split_state(result, state, split_plan):
 
 
 def cleanup_completed_split_state_for_book(book_record, result, book_name):
-    if not _should_cleanup_completed_split_states():
-        return result
-
     try:
-        if delete_split_processing_state(book_record, only_if_completed=True):
+        if delete_split_processing_state(book_record, only_if_completed=False):
             result.state_path = ""
-            log.info("[%s] 长音频分片状态已完成并已从数据库清理，避免继续占用空间。", book_name)
+            log.info("[%s] Split upload state deleted.", book_name)
     except Exception as e:
-        log.warning("[%s] 清理已完成分片状态失败: %s", book_name, e)
+        log.warning("[%s] Failed to delete split upload state: %s", book_name, e)
     return result
 
 
@@ -5749,26 +5822,57 @@ def _update_book_tags_in_database(book_id, tags_value):
     )
 
 
+def finalize_successful_book_for_project(book_record, result, book_name, flag):
+    new_status = build_supabase_text_update(book_record.get("status"), [flag] if flag else [], prefer="string")
+
+    try:
+        _update_book_status_in_database(book_record["book_id"], new_status)
+        book_record["status"] = new_status
+        log.info("Completed and marked status='%s'", new_status)
+    except Exception as e:
+        log.error("[%s] Failed to update books.status: %s", book_name, e)
+        result.success = False
+        if getattr(result, "split_mode", False):
+            result.pending_resume = True
+            result.error = f"Split upload finished, but updating books.status failed: {e}"
+        else:
+            result.error = f"Output finished, but updating books.status failed: {e}"
+        return False
+
+    if getattr(result, "split_mode", False):
+        try:
+            if delete_split_processing_state(book_record, only_if_completed=False):
+                result.state_path = ""
+                log.info("[%s] Split upload finalized and book_processing_states deleted.", book_name)
+        except Exception as e:
+            log.error(
+                "[%s] books.status updated, but deleting book_processing_states failed; startup cleanup will retry: %s",
+                book_name,
+                e,
+            )
+
+    return True
+
+
 def run_pipeline(runtime_config: dict | None = None):
     apply_runtime_config(runtime_config)
     validate_runtime_config()
 
     execute_postgres_fetchval("SELECT 1 AS ok")
-    log.info("PostgreSQL 连接成功")
+    log.info("PostgreSQL connected")
 
     applied_cloud_overrides = apply_cloud_runtime_overrides()
     if applied_cloud_overrides:
-        log.info("已应用云端运行配置覆盖: %s", "、".join(sorted(applied_cloud_overrides.keys())))
+        log.info("Applied cloud runtime overrides: %s", ", ".join(sorted(applied_cloud_overrides.keys())))
 
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
-
     sync_music_library_if_enabled()
 
-    # ── 查询书籍 ──
-    cat_label = TARGET_CATEGORY.strip() or "全部"
-    log.info("查询书籍... 分类=%s", cat_label)
+    cat_label = TARGET_CATEGORY.strip() or "all"
+    log.info("Fetching books... category=%s", cat_label)
 
     all_books = []
+    all_books_by_id = {}
     page_size = 100
     offset = 0
 
@@ -5776,7 +5880,12 @@ def run_pipeline(runtime_config: dict | None = None):
         rows = _fetch_books_page_from_database(offset, page_size)
         if not rows:
             break
+
         for row in rows:
+            book_id = str(row.get("book_id") or "").strip()
+            if book_id:
+                all_books_by_id[book_id] = row
+
             tags_list = set(normalize_text_items(row.get("tags")))
             if "bad" not in tags_list:
                 all_books.append(row)
@@ -5785,22 +5894,22 @@ def run_pipeline(runtime_config: dict | None = None):
             break
         offset += page_size
 
-    # ── 过滤已处理的书（不同项目标记互不干扰） ──
     flag = PROJECT_FLAG.strip()
+    interrupted_states = list_interrupted_book_states(all_books_by_id) if all_books_by_id else {}
+
     if not FORCE_REPROCESS and flag:
         filtered_books = []
-        for b in all_books:
-            existing_flags = set(normalize_text_items(b.get("status")))
+        for book in all_books:
+            existing_flags = set(normalize_text_items(book.get("status")))
             if flag not in existing_flags:
-                filtered_books.append(b)
+                filtered_books.append(book)
         all_books = filtered_books
 
-    log.info("过滤后共 %d 本待处理的书", len(all_books))
+    log.info("Books remaining after status filter: %d", len(all_books))
 
     if all_books:
-        interrupted_states = list_interrupted_book_states()
-        interrupted_books = [b for b in all_books if str(b.get("book_id")) in interrupted_states]
-        fresh_books = [b for b in all_books if str(b.get("book_id")) not in interrupted_states]
+        interrupted_books = [book for book in all_books if str(book.get("book_id")) in interrupted_states]
+        fresh_books = [book for book in all_books if str(book.get("book_id")) not in interrupted_states]
         random.shuffle(fresh_books)
 
         if PRIORITIZE_INTERRUPTED_BOOKS and interrupted_books:
@@ -5809,11 +5918,11 @@ def run_pipeline(runtime_config: dict | None = None):
                 reverse=True,
             )
             all_books = interrupted_books + fresh_books
-            log.info("检测到 %d 本上次未完成的长音频，已优先续跑。", len(interrupted_books))
+            log.info("Prioritizing %d interrupted or finalize-only split books.", len(interrupted_books))
         else:
             all_books = fresh_books + interrupted_books
             random.shuffle(all_books)
-            log.info("已随机打乱本次待处理 books 顺序，共 %d 本", len(all_books))
+            log.info("Shuffled processing order for %d books.", len(all_books))
 
     try:
         success_target_count = max(0, int(MAX_PROCESS_COUNT or 0))
@@ -5821,10 +5930,10 @@ def run_pipeline(runtime_config: dict | None = None):
         success_target_count = 0
 
     if success_target_count > 0:
-        log.info("本次最多成功完成并上传 %d 本；失败或中断不计入额度。", success_target_count)
+        log.info("This run will stop after %d successful uploads.", success_target_count)
 
     if not all_books:
-        print("⚠️ 没有待处理的书籍（全部已完成、无匹配分类或全部缺失章节数据）")
+        print("No books to process.")
         return {
             "success": True,
             "results": [],
@@ -5847,27 +5956,63 @@ def run_pipeline(runtime_config: dict | None = None):
 
     for i, book in enumerate(all_books, start=1):
         if success_target_count > 0 and successful_upload_count >= success_target_count:
-            stop_reason = f"已达到本次成功上传上限 {success_target_count} 本，停止继续处理新书"
+            stop_reason = f"Reached upload target for this run: {success_target_count}"
             log.info(stop_reason)
             break
 
         should_stop, remaining_seconds = should_stop_before_next_book(run_started_at)
         if should_stop:
-            stop_reason = f"触发 Colab 时长保护，剩余约 {max(0, int(remaining_seconds))} 秒，停止启动新书"
+            stop_reason = f"Colab runtime guard triggered with about {max(0, int(remaining_seconds))} seconds remaining"
             log.warning(stop_reason)
             break
 
-        name = book.get("book_name", "未知")
-        cat = book.get("category", "未分类")
+        name = book.get("book_name", "unknown")
+        cat = book.get("category", "uncategorized")
         print(f"\n{'=' * 50}")
-        log.info("[%d/%d] 📗 %s | %s", i, len(all_books), name, cat)
+        log.info("[%d/%d] Book: %s | %s", i, len(all_books), name, cat)
 
         try:
             result = process_book(book, run_started_at=run_started_at)
         except Exception as e:
-            log.error("[%s] 单书处理出现未捕获异常: %s", name, e)
-            result = BookResult(book_id=str(book.get("book_id", "")), book_name=name, category=cat, error=f"未捕获异常: {e}")
+            log.error("[%s] Uncaught exception while processing book: %s", name, e)
+            result = BookResult(book_id=str(book.get("book_id", "")), book_name=name, category=cat, error=f"Uncaught exception: {e}")
+
         all_results.append(result)
+        should_break_after_summary = False
+
+        if result.success:
+            finalize_successful_book_for_project(book, result, name, flag)
+
+        if result.success:
+            if counts_towards_max_process(result):
+                successful_upload_count += 1
+                if success_target_count > 0:
+                    log.info("Upload counter progress: %d/%d", successful_upload_count, success_target_count)
+
+            log.info(
+                "chapters=%d merged=%s mixed=%s",
+                result.success_count,
+                os.path.basename(result.merged_audio_path) if result.merged_audio_path else "none",
+                os.path.basename(result.mixed_audio_path) if result.mixed_audio_path else "none",
+            )
+        elif result.pending_resume:
+            log.warning("Resume state saved: %s", result.error)
+            if result.stop_requested:
+                stop_reason = result.error
+                should_break_after_summary = True
+        else:
+            log.error("Failure: %s", result.error)
+
+            if "chapters_data" in result.error:
+                existing_tags = normalize_text_items(book.get("tags"))
+                if "bad" not in existing_tags:
+                    new_tags = build_supabase_text_update(book.get("tags"), ["bad"], prefer="array")
+                    try:
+                        _update_book_tags_in_database(book["book_id"], new_tags)
+                        book["tags"] = new_tags
+                        log.info("Marked book tags with 'bad'.")
+                    except Exception as e:
+                        log.error("Failed to update tags: %s", e)
 
         try:
             save_run_summary(
@@ -5881,70 +6026,31 @@ def run_pipeline(runtime_config: dict | None = None):
                 },
             )
         except Exception as e:
-            log.warning("增量运行汇总写入失败: %s", e)
+            log.warning("Failed to write incremental run summary: %s", e)
 
-        if result.success:
-            new_status = build_supabase_text_update(book.get("status"), [flag] if flag else [], prefer="string")
-
-            try:
-                _update_book_status_in_database(book["book_id"], new_status)
-                book["status"] = new_status
-                log.info("🎉 完成并标记 status='%s'", new_status)
-                if getattr(result, "split_mode", False):
-                    cleanup_completed_split_state_for_book(book, result, name)
-            except Exception as e:
-                log.error("标记 status 失败: %s", e)
-
-            if counts_towards_max_process(result):
-                successful_upload_count += 1
-                if success_target_count > 0:
-                    log.info("成功上传计数进度: %d/%d", successful_upload_count, success_target_count)
-
-            log.info(
-                "章节=%d 合并=%s 混音=%s",
-                result.success_count,
-                os.path.basename(result.merged_audio_path) if result.merged_audio_path else "无",
-                os.path.basename(result.mixed_audio_path) if result.mixed_audio_path else "无",
-            )
-        elif result.pending_resume:
-            log.warning("⏸️ 已保存续跑状态: %s", result.error)
-            if result.stop_requested:
-                stop_reason = result.error
-                break
-        else:
-            log.error("❌ 失败: %s", result.error)
-
-            if "chapters_data 为空" in result.error:
-                existing_tags = normalize_text_items(book.get("tags"))
-                if "bad" not in existing_tags:
-                    new_tags = build_supabase_text_update(book.get("tags"), ["bad"], prefer="array")
-                    try:
-                        _update_book_tags_in_database(book["book_id"], new_tags)
-                        book["tags"] = new_tags
-                        log.info("🚧 识别到无效数据，已在 tags 中追加 'bad'")
-                    except Exception as e:
-                        log.error("追加 tags 失败: %s", e)
+        if should_break_after_summary:
+            break
 
     success = sum(1 for r in all_results if r.success)
     partial = sum(1 for r in all_results if getattr(r, "pending_resume", False))
     failed = len(all_results) - success - partial
     print("\n" + "=" * 42)
-    print("  处理完成")
-    print(f"  总计: {len(all_results)}  成功: {success}  续跑中: {partial}  失败: {failed}")
+    print("  Run Complete")
+    print(f"  Total: {len(all_results)}  Success: {success}  Resume: {partial}  Failed: {failed}")
     if success_target_count > 0:
-        print(f"  成功上传计数: {successful_upload_count}/{success_target_count}")
-    print(f"  输出目录: {OUTPUT_ROOT}")
+        print(f"  Upload Counter: {successful_upload_count}/{success_target_count}")
+    print(f"  Output Dir: {OUTPUT_ROOT}")
     summary_path = save_run_summary(
         OUTPUT_ROOT,
         all_results,
         archive=True,
         extra={
-            "run_started_at": dt_module.datetime.fromtimestamp(run_started_at).isoformat() if "run_started_at" in locals() else "",
-            "elapsed_seconds": round(time.time() - run_started_at, 1) if "run_started_at" in locals() else 0,
+            "run_started_at": dt_module.datetime.fromtimestamp(run_started_at).isoformat(),
+            "elapsed_seconds": round(time.time() - run_started_at, 1),
             "stop_reason": stop_reason,
         },
     )
-    print(f"  运行汇总: {summary_path}")
+    print(f"  Summary: {summary_path}")
     print("=" * 42)
 
     return {
