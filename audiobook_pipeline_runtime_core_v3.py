@@ -1990,8 +1990,11 @@ def _maybe_log_split_state_persisted(book_record, state, state_ref):
     if match:
         part_index = int(match.group(1))
         suffix = match.group(2)
+        part_state = get_split_part_state(state, part_index) or {}
 
         if suffix == "upload_persisted":
+            if not _split_part_has_uploaded_video(part_state):
+                return
             log.info(
                 "[%s] 分片 %d/%d 的上传回执已写入数据库续跑状态（进度 %d/%d，state=%s）",
                 book_name,
@@ -2004,6 +2007,8 @@ def _maybe_log_split_state_persisted(book_record, state, state_ref):
             return
 
         if suffix == "completed":
+            if not _split_part_is_completed(part_state):
+                return
             log.info(
                 "[%s] 分片 %d/%d 已处理完成，当前状态已写入数据库（进度 %d/%d，state=%s）",
                 book_name,
@@ -2016,6 +2021,8 @@ def _maybe_log_split_state_persisted(book_record, state, state_ref):
             return
 
         if suffix == "failed":
+            if str(part_state.get("status") or "").strip().lower() != "failed":
+                return
             log.warning(
                 "[%s] 分片 %d/%d 的失败状态已写入数据库（进度 %d/%d，state=%s，error=%s）",
                 book_name,
@@ -2029,6 +2036,8 @@ def _maybe_log_split_state_persisted(book_record, state, state_ref):
             return
 
     if last_stage == "playlist_completed":
+        if not progress["playlist_completed"]:
+            return
         log.info(
             "[%s] 播放列表完成状态已写入数据库（进度 %d/%d，state=%s）",
             book_name,
@@ -2050,6 +2059,8 @@ def _maybe_log_split_state_persisted(book_record, state, state_ref):
         return
 
     if last_stage == "all_parts_completed":
+        if not progress["fully_completed"]:
+            return
         log.info(
             "[%s] 多 P 最终完成状态已写入数据库（进度 %d/%d，state=%s）",
             book_name,
@@ -2404,15 +2415,25 @@ def finalize_book_result(result, book_dir, book_record=None):
             if ENABLE_YOUTUBE_UPLOAD
             else result.video_ready
         )
-        result.pending_resume = bool(getattr(result, "pending_resume", False)) or not all_parts_completed or (
-            playlist_required and not playlist_completed
-        )
+        computed_pending_resume = (not all_parts_completed) or (playlist_required and not playlist_completed)
+        stale_pending_resume = bool(getattr(result, "pending_resume", False)) and not computed_pending_resume
+        result.pending_resume = computed_pending_resume
         required_stages = [result.audio_ready]
         if ENABLE_VIDEO_GENERATION:
             required_stages.append(result.video_ready)
         if ENABLE_YOUTUBE_UPLOAD:
             required_stages.append(result.upload_ready)
         result.success = all(required_stages) and all_parts_completed and playlist_completed and not result.pending_resume
+        if stale_pending_resume:
+            log.warning(
+                "[%s] Clearing stale pending_resume during final split evaluation. completed=%d/%d playlist_required=%s playlist_completed=%s state=%s",
+                result.book_name,
+                completed_part_count,
+                part_count,
+                playlist_required,
+                playlist_completed,
+                getattr(result, "state_path", ""),
+            )
     else:
         result.audio_ready = bool(result.merged_audio_path and os.path.exists(result.merged_audio_path))
         result.video_ready = bool(result.video_path and os.path.exists(result.video_path))
@@ -2435,6 +2456,22 @@ def finalize_book_result(result, book_dir, book_record=None):
             result.error = "MP4 成品未准备完成"
         elif ENABLE_YOUTUBE_UPLOAD and not result.upload_ready:
             result.error = "YouTube 上传未完成"
+
+    if getattr(result, "split_mode", False) and not result.success:
+        log.error(
+            "[%s] Split finalization failed: completed_part_count=%d part_count=%d pending_resume=%s playlist_required=%s playlist_completed=%s audio_ready=%s video_ready=%s upload_ready=%s state=%s error=%s",
+            result.book_name,
+            completed_part_count,
+            part_count,
+            bool(getattr(result, "pending_resume", False)),
+            bool(getattr(result, "playlist_required", False)),
+            bool(getattr(result, "playlist_completed", False)),
+            bool(getattr(result, "audio_ready", False)),
+            bool(getattr(result, "video_ready", False)),
+            bool(getattr(result, "upload_ready", False)),
+            getattr(result, "state_path", ""),
+            str(getattr(result, "error", "") or ""),
+        )
 
     report = {
         "generated_at": dt_module.datetime.now().isoformat(),
