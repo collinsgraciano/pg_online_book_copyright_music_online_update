@@ -1826,6 +1826,59 @@ def load_split_processing_state(book_record):
         raise RuntimeError(f"从数据库读取断点状态失败，请检查表 {table_name}: {e}")
 
 
+def _build_split_state_completeness_rank(state):
+    if not isinstance(state, dict) or not state:
+        return (-1, -1, -1, -1)
+
+    progress = evaluate_split_completion_state(state)
+    playlist_state = get_split_playlist_state(state) if state.get("mode") == "split_upload" else {}
+    return (
+        int(progress.get("completed_part_count") or 0),
+        1 if bool(progress.get("playlist_completed")) else 0,
+        1 if str(playlist_state.get("playlist_id") or "").strip() else 0,
+        1 if str(playlist_state.get("status") or "").strip().lower() == "completed" else 0,
+    )
+
+
+def reload_split_processing_state(book_record, fallback_state=None, book_name=""):
+    loaded_state = load_split_processing_state(book_record)
+    if not isinstance(loaded_state, dict) or not loaded_state:
+        return fallback_state if isinstance(fallback_state, dict) else loaded_state
+
+    if not isinstance(fallback_state, dict) or not fallback_state:
+        return loaded_state
+
+    loaded_rank = _build_split_state_completeness_rank(loaded_state)
+    fallback_rank = _build_split_state_completeness_rank(fallback_state)
+    if loaded_rank < fallback_rank:
+        label = str(
+            book_name
+            or book_record.get("book_name")
+            or fallback_state.get("book_name")
+            or loaded_state.get("book_name")
+            or book_record.get("book_id")
+            or "unknown-book"
+        ).strip()
+        loaded_playlist = get_split_playlist_state(loaded_state) if loaded_state.get("mode") == "split_upload" else {}
+        fallback_playlist = (
+            get_split_playlist_state(fallback_state) if fallback_state.get("mode") == "split_upload" else {}
+        )
+        log.warning(
+            "[%s] Reloaded split state looks older than the in-memory state; keeping the more complete local state. "
+            "loaded_rank=%s local_rank=%s loaded_playlist_id=%s local_playlist_id=%s loaded_playlist_status=%s local_playlist_status=%s",
+            label,
+            loaded_rank,
+            fallback_rank,
+            str(loaded_playlist.get("playlist_id") or ""),
+            str(fallback_playlist.get("playlist_id") or ""),
+            str(loaded_playlist.get("status") or ""),
+            str(fallback_playlist.get("status") or ""),
+        )
+        return fallback_state
+
+    return loaded_state
+
+
 def _save_split_processing_state_raw(book_record, state):
     now = dt_module.datetime.now().isoformat()
     parts = state.get("parts", [])
@@ -4598,6 +4651,76 @@ def _list_playlist_items_with_client(youtube, playlist_id):
     return items
 
 
+def _list_owned_playlists_with_client(youtube):
+    playlists = []
+    page_token = None
+    while True:
+        response = youtube.playlists().list(
+            part="snippet,status",
+            mine=True,
+            maxResults=50,
+            pageToken=page_token,
+        ).execute()
+        for item in response.get("items", []):
+            playlists.append(
+                {
+                    "playlist_id": str(item.get("id") or "").strip(),
+                    "playlist_url": f"https://www.youtube.com/playlist?list={str(item.get('id') or '').strip()}",
+                    "title": str((item.get("snippet") or {}).get("title") or "").strip(),
+                    "description": str((item.get("snippet") or {}).get("description") or ""),
+                    "privacy_status": normalize_playlist_privacy_status(
+                        (item.get("status") or {}).get("privacyStatus") or "public"
+                    ),
+                }
+            )
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    return playlists
+
+
+def _find_matching_owned_playlist_with_client(youtube, title, ordered_video_ids=None, privacy_status="public"):
+    normalized_title = str(title or "").strip()
+    desired_video_ids = [str(video_id).strip() for video_id in (ordered_video_ids or []) if str(video_id).strip()]
+    normalized_privacy = normalize_playlist_privacy_status(privacy_status)
+    if not normalized_title:
+        return {}
+
+    title_matches = []
+    for playlist in _list_owned_playlists_with_client(youtube):
+        if str(playlist.get("title") or "").strip() != normalized_title:
+            continue
+        title_matches.append(playlist)
+
+    if not title_matches:
+        return {}
+
+    exact_content_match = {}
+    privacy_match = {}
+    for playlist in title_matches:
+        playlist_id = str(playlist.get("playlist_id") or "").strip()
+        if not playlist_id:
+            continue
+        if desired_video_ids:
+            try:
+                playlist_items = _list_playlist_items_with_client(youtube, playlist_id)
+            except Exception:
+                playlist_items = []
+            existing_video_ids = [str(item.get("video_id") or "").strip() for item in playlist_items if str(item.get("video_id") or "").strip()]
+            if existing_video_ids == desired_video_ids:
+                exact_content_match = playlist
+                if str(playlist.get("privacy_status") or "").strip().lower() == normalized_privacy:
+                    return playlist
+        if not privacy_match and str(playlist.get("privacy_status") or "").strip().lower() == normalized_privacy:
+            privacy_match = playlist
+
+    if exact_content_match:
+        return exact_content_match
+    if privacy_match:
+        return privacy_match
+    return title_matches[0]
+
+
 def _delete_playlist_item_with_client(youtube, playlist_item_id):
     youtube.playlistItems().delete(id=playlist_item_id).execute()
 
@@ -4661,6 +4784,22 @@ def sync_youtube_playlist(channel_name, title, description, ordered_video_ids, p
         "success": False,
     }
     original_playlist_id = str(playlist_id or "").strip()
+    if not original_playlist_id:
+        recovered_playlist = _find_matching_owned_playlist_with_client(
+            youtube,
+            title=title,
+            ordered_video_ids=ordered_video_ids,
+            privacy_status=privacy_status,
+        )
+        recovered_playlist_id = str(recovered_playlist.get("playlist_id") or "").strip() if isinstance(recovered_playlist, dict) else ""
+        if recovered_playlist_id:
+            playlist_id = recovered_playlist_id
+            playlist_result.update(recovered_playlist)
+            log.info(
+                "Detected an existing owned playlist with the same title and adopted it for sync: playlist_id=%s title=%s",
+                recovered_playlist_id,
+                str(recovered_playlist.get("title") or title or ""),
+            )
 
     for attempt_index in range(2):
         try:
@@ -5118,6 +5257,10 @@ def sync_split_playlist(result, state, split_plan, book_record, book_name):
     result.playlist_id = playlist_state["playlist_id"]
     result.playlist_url = playlist_state.get("playlist_url", "")
     result.playlist_title = playlist_state.get("title", "")
+    result.playlist_required = True
+    result.playlist_completed = True
+    result.pending_resume = False
+    result.error = ""
     return result
 
 
@@ -5867,7 +6010,7 @@ def process_split_book(result, book_record, book_data, chapters_sorted, book_dir
             result.error = str(e)
             break
 
-    state = load_split_processing_state(book_record) or state
+    state = reload_split_processing_state(book_record, fallback_state=state, book_name=book_name)
     sync_result_from_split_state(result, state, split_plan)
 
     if result.completed_part_count >= result.part_count:
@@ -5881,7 +6024,7 @@ def process_split_book(result, book_record, book_data, chapters_sorted, book_dir
                 result.state_path = state_ref
 
                 sync_split_playlist(result, state, split_plan, book_record, book_name)
-                state = load_split_processing_state(book_record) or state
+                state = reload_split_processing_state(book_record, fallback_state=state, book_name=book_name)
                 sync_result_from_split_state(result, state, split_plan)
                 if not bool(getattr(result, "playlist_completed", False)):
                     playlist_state = get_split_playlist_state(state)
@@ -5920,7 +6063,7 @@ def process_split_book(result, book_record, book_data, chapters_sorted, book_dir
         state["last_stage"] = "all_parts_completed"
         state_ref = save_split_processing_state(book_record, state)
         result.state_path = state_ref
-        state = load_split_processing_state(book_record) or state
+        state = reload_split_processing_state(book_record, fallback_state=state, book_name=book_name)
         sync_result_from_split_state(result, state, split_plan)
         result.pending_resume = not (
             result.completed_part_count >= result.part_count
