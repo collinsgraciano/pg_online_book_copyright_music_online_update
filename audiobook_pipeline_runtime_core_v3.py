@@ -1084,9 +1084,44 @@ def estimate_chapter_duration_seconds(chapter):
     return 1
 
 
+def get_explicit_chapter_duration_seconds(chapter):
+    if not isinstance(chapter, dict):
+        return None
+
+    direct_value = chapter.get("duration_seconds")
+    if isinstance(direct_value, (int, float)) and direct_value > 0:
+        return max(1, int(round(float(direct_value))))
+
+    for key in ("long", "duration", "audioDuration", "audio_duration"):
+        value = chapter.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            return max(1, int(round(float(value))))
+        seconds = parse_duration_to_seconds(value)
+        if seconds > 0:
+            return seconds
+
+    return None
+
+
+def get_explicit_total_book_duration_seconds(chapters_sorted):
+    if not chapters_sorted:
+        return 0
+
+    total_seconds = 0
+    for chapter in chapters_sorted:
+        chapter_seconds = get_explicit_chapter_duration_seconds(chapter)
+        if chapter_seconds is None:
+            return None
+        total_seconds += chapter_seconds
+    return total_seconds
+
+
 def format_seconds_hhmmss(total_seconds):
     seconds = max(0, int(total_seconds or 0))
     return f"{seconds // 3600:02d}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
+
+
+MIN_BOOK_DURATION_SECONDS = 30 * 60
 
 
 def build_split_part_plans(chapters_sorted):
@@ -2453,6 +2488,14 @@ def list_interrupted_book_states(book_rows_by_id=None):
 
 
 def finalize_book_result(result, book_dir, book_record=None):
+    if bool(getattr(result, "skipped", False)):
+        result.audio_ready = False
+        result.video_ready = False
+        result.upload_ready = False
+        result.pending_resume = False
+        result.success = False
+        return result
+
     part_count = max(1, int(getattr(result, "part_count", 1) or 1))
     completed_part_count = max(0, int(getattr(result, "completed_part_count", 0) or 0))
 
@@ -2601,13 +2644,17 @@ def save_run_summary(output_root, results, archive=True, extra=None):
     timestamp = dt_module.datetime.now().strftime("%Y%m%d_%H%M%S")
     success_items = [r for r in results if r.success]
     partial_items = [r for r in results if getattr(r, "pending_resume", False)]
-    failed_items = [r for r in results if not r.success and not getattr(r, "pending_resume", False)]
+    skipped_items = [r for r in results if getattr(r, "skipped", False)]
+    failed_items = [
+        r for r in results if not r.success and not getattr(r, "pending_resume", False) and not getattr(r, "skipped", False)
+    ]
     summary = {
         "generated_at": dt_module.datetime.now().isoformat(),
         "config": collect_runtime_config_snapshot(),
         "total": len(results),
         "success": len(success_items),
         "partial": len(partial_items),
+        "skipped": len(skipped_items),
         "failed": len(failed_items),
         "success_items": [
             {
@@ -2630,6 +2677,15 @@ def save_run_summary(output_root, results, archive=True, extra=None):
                 "part_count": getattr(r, "part_count", 1),
             }
             for r in partial_items
+        ],
+        "skipped_items": [
+            {
+                "book_id": r.book_id,
+                "book_name": r.book_name,
+                "reason": getattr(r, "skipped_reason", "") or r.error,
+                "deleted_from_books": bool(getattr(r, "deleted_from_books", False)),
+            }
+            for r in skipped_items
         ],
         "failed_items": [
             {
@@ -4981,6 +5037,9 @@ class BookResult:
     video_ready: bool = False
     upload_ready: bool = False
     success: bool = False
+    skipped: bool = False
+    deleted_from_books: bool = False
+    skipped_reason: str = ""
     error: str = ""
 
 
@@ -6139,6 +6198,34 @@ def process_split_book(result, book_record, book_data, chapters_sorted, book_dir
     return result
 
 
+def skip_and_delete_short_book(book_record, result, book_name):
+    duration_text = format_seconds_hhmmss(getattr(result, "estimated_total_duration_seconds", 0))
+    short_reason = (
+        f"预估总时长 {duration_text} 小于 {format_seconds_hhmmss(MIN_BOOK_DURATION_SECONDS)}，"
+        "已跳过处理并从 books 表删除。"
+    )
+    try:
+        _delete_book_from_database(book_record["book_id"])
+        try:
+            if delete_split_processing_state(book_record, only_if_completed=False):
+                result.state_path = ""
+        except Exception as state_error:
+            log.warning("[%s] books 记录已删除，但清理 book_processing_states 失败: %s", book_name, state_error)
+    except Exception as e:
+        result.error = (
+            f"预估总时长 {duration_text} 小于 {format_seconds_hhmmss(MIN_BOOK_DURATION_SECONDS)}，"
+            f"但删除 books 记录失败: {e}"
+        )
+        return result
+
+    result.skipped = True
+    result.deleted_from_books = True
+    result.skipped_reason = short_reason
+    result.error = short_reason
+    log.info("[%s] %s", book_name, short_reason)
+    return result
+
+
 def process_book(book_record: dict, run_started_at=None) -> BookResult:
     """
     单书处理入口：
@@ -6175,6 +6262,7 @@ def process_book(book_record: dict, run_started_at=None) -> BookResult:
     chapters = book_data.get("chapters_data", []) or []
     chapters_sorted = sorted(chapters, key=lambda c: c.get("id", 0))
     result.chapter_count = len(chapters_sorted)
+    explicit_total_duration_seconds = get_explicit_total_book_duration_seconds(chapters_sorted)
 
     if not chapters_sorted:
         final_path = os.path.join(book_dir, f"{safe_name}_mixed.mp3" if ENABLE_BGM_MIX else f"{safe_name}.mp3")
@@ -6188,6 +6276,12 @@ def process_book(book_record: dict, run_started_at=None) -> BookResult:
 
     split_plan = build_split_part_plans(chapters_sorted)
     result.estimated_total_duration_seconds = split_plan.get("estimated_total_seconds", 0)
+    if explicit_total_duration_seconds is not None:
+        result.estimated_total_duration_seconds = explicit_total_duration_seconds
+
+    if explicit_total_duration_seconds is not None and 0 < int(explicit_total_duration_seconds or 0) < MIN_BOOK_DURATION_SECONDS:
+        skip_and_delete_short_book(book_record, result, book_name)
+        return finish()
 
     if split_plan.get("split_mode"):
         process_split_book(
@@ -6246,6 +6340,14 @@ def _update_book_tags_in_database(book_id, tags_value):
     execute_postgres(
         sql.SQL("UPDATE {} SET tags = %s WHERE book_id = %s").format(table_sql),
         (tags_value, str(book_id)),
+    )
+
+
+def _delete_book_from_database(book_id):
+    table_sql = get_public_table_identifier("books")
+    execute_postgres(
+        sql.SQL("DELETE FROM {} WHERE book_id = %s").format(table_sql),
+        (str(book_id),),
     )
 
 
@@ -6422,6 +6524,8 @@ def run_pipeline(runtime_config: dict | None = None):
                 os.path.basename(result.merged_audio_path) if result.merged_audio_path else "none",
                 os.path.basename(result.mixed_audio_path) if result.mixed_audio_path else "none",
             )
+        elif result.skipped:
+            log.info("Skipped: %s", getattr(result, "skipped_reason", "") or result.error)
         elif result.pending_resume:
             log.warning("Resume state saved: %s", result.error)
             if result.stop_requested:
@@ -6460,10 +6564,11 @@ def run_pipeline(runtime_config: dict | None = None):
 
     success = sum(1 for r in all_results if r.success)
     partial = sum(1 for r in all_results if getattr(r, "pending_resume", False))
-    failed = len(all_results) - success - partial
+    skipped = sum(1 for r in all_results if getattr(r, "skipped", False))
+    failed = len(all_results) - success - partial - skipped
     print("\n" + "=" * 42)
     print("  Run Complete")
-    print(f"  Total: {len(all_results)}  Success: {success}  Resume: {partial}  Failed: {failed}")
+    print(f"  Total: {len(all_results)}  Success: {success}  Resume: {partial}  Skipped: {skipped}  Failed: {failed}")
     if success_target_count > 0:
         print(f"  Upload Counter: {successful_upload_count}/{success_target_count}")
     print(f"  Output Dir: {OUTPUT_ROOT}")
