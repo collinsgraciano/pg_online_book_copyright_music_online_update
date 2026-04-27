@@ -3257,10 +3257,34 @@ def build_modelscope_token_pool(token_value, shuffle_once=False):
     return normalized_tokens
 
 
+def clone_modelscope_token_pool(token_value, shuffle_once=False):
+    cloned_tokens = normalize_modelscope_token_pool(token_value)
+    if shuffle_once and len(cloned_tokens) > 1:
+        random.shuffle(cloned_tokens)
+    return cloned_tokens
+
+
+def build_modelscope_token_pool_bundle(token_value, shuffle_once=False):
+    base_tokens = build_modelscope_token_pool(token_value, shuffle_once=shuffle_once)
+    return {
+        "text": list(base_tokens),
+        "image": list(base_tokens),
+    }
+
+
 def _get_modelscope_active_tokens(token_pool):
     if isinstance(token_pool, list):
         return normalize_modelscope_token_pool(token_pool, preserve_list_reference=True)
     return normalize_modelscope_token_pool(token_pool)
+
+
+def _get_modelscope_usage_token_pool(token_source, usage):
+    if isinstance(token_source, dict):
+        token_pool = token_source.get(usage)
+        if isinstance(token_pool, list):
+            return normalize_modelscope_token_pool(token_pool, preserve_list_reference=True)
+        return normalize_modelscope_token_pool(token_pool)
+    return _get_modelscope_active_tokens(token_source)
 
 
 def _remove_modelscope_token_from_pool(token_pool, token_text):
@@ -3318,6 +3342,39 @@ def _extract_http_error_details(error):
         except Exception:
             response_text = ""
     return status_code, request_url, response_text
+
+
+def is_modelscope_http_401_error(error):
+    status_code, request_url, response_text = _extract_http_error_details(error)
+    merged_text = "\n".join(part for part in [str(error or ""), response_text, request_url] if part).lower()
+    return (
+        status_code == 401
+        or "401 client error" in merged_text
+        or "status code 401" in merged_text
+        or "error code: 401" in merged_text
+        or "'code': 401" in merged_text
+        or '"code":401' in merged_text
+        or '"code": 401' in merged_text
+        or "unauthorized" in merged_text
+    )
+
+
+def _log_modelscope_token_401(task_label, current_token, error, token_index=None, total_tokens=None, model_name=None):
+    status_code, request_url, response_text = _extract_http_error_details(error)
+    token_position = ""
+    if token_index is not None and total_tokens is not None:
+        token_position = f"，token={token_index}/{total_tokens}"
+    model_text = f"，model={model_name}" if model_name else ""
+    log.error(
+        "❌ %s 命中 401，当前 token 疑似无效%s%s。token=%s | request_url=%s | response=%s | 原始错误：%s",
+        task_label,
+        model_text,
+        token_position,
+        current_token,
+        request_url or "无",
+        response_text or f"status_code={status_code}",
+        error,
+    )
 
 
 def is_modelscope_image_review_rejection_error(error):
@@ -3390,7 +3447,61 @@ def _sleep_before_next_modelscope_token():
     time.sleep(delay_seconds)
 
 
-def _run_qwen_task_with_token_rotation(task_label, token_pool, attempt, runner, max_quota_rounds=2):
+def _get_modelscope_text_model_sequence():
+    return [
+        "Qwen/Qwen3.5-397B-A17B",
+        "deepseek-ai/DeepSeek-V4-Pro",
+    ]
+
+
+def _create_modelscope_openai_client(current_token):
+    from openai import OpenAI
+
+    return OpenAI(
+        base_url="https://api-inference.modelscope.cn/v1",
+        api_key=current_token,
+    )
+
+
+def _extract_modelscope_chat_content(response):
+    choices = getattr(response, "choices", None) or []
+    first_choice = choices[0] if choices else None
+    if not first_choice:
+        return ""
+
+    message = getattr(first_choice, "message", None)
+    content = getattr(message, "content", None)
+    if isinstance(content, list):
+        merged_parts = []
+        for item in content:
+            if isinstance(item, dict):
+                merged_parts.append(str(item.get("text") or item.get("content") or ""))
+            else:
+                merged_parts.append(str(getattr(item, "text", "") or getattr(item, "content", "") or ""))
+        content = "".join(merged_parts)
+    return str(content or "").strip()
+
+
+def _strip_markdown_code_fences(text):
+    cleaned_text = str(text or "").strip()
+    if cleaned_text.startswith("```json"):
+        cleaned_text = cleaned_text[7:]
+    if cleaned_text.startswith("```"):
+        cleaned_text = cleaned_text[3:]
+    if cleaned_text.endswith("```"):
+        cleaned_text = cleaned_text[:-3]
+    return cleaned_text.strip()
+
+
+def _run_qwen_task_with_token_rotation(
+    task_label,
+    token_pool,
+    attempt,
+    runner,
+    max_quota_rounds=2,
+    model_name="Qwen/Qwen3.5-397B-A17B",
+    invalid_token_pool=None,
+):
     active_tokens = _get_modelscope_active_tokens(token_pool)
     if not active_tokens:
         raise ValueError(f"{task_label} 未提供可用的 ModelScope Token。")
@@ -3404,25 +3515,43 @@ def _run_qwen_task_with_token_rotation(task_label, token_pool, attempt, runner, 
             break
         quota_hit_this_round = False
         round_tokens = list(active_tokens)
+        total_tokens = len(round_tokens)
 
         for token_index, current_token in enumerate(round_tokens, start=1):
             try:
                 return runner(current_token), collected_errors
             except Exception as e:
+                if is_modelscope_http_401_error(e):
+                    _remove_modelscope_token_from_pool(token_pool, current_token)
+                    _remove_modelscope_token_from_pool(invalid_token_pool, current_token)
+                    has_next_token = token_index < total_tokens
+                    collected_errors.append(f"401 token={current_token} error={e}")
+                    _log_modelscope_token_401(
+                        task_label=task_label,
+                        current_token=current_token,
+                        error=e,
+                        token_index=token_index,
+                        total_tokens=total_tokens,
+                        model_name=model_name,
+                    )
+                    if has_next_token:
+                        _sleep_before_next_modelscope_token()
+                    continue
+
                 if is_modelscope_http_429_error(e):
                     _remove_modelscope_token_from_pool(token_pool, current_token)
-                    active_tokens = _get_modelscope_active_tokens(token_pool)
-                    has_next_token = bool(active_tokens)
+                    has_next_token = token_index < total_tokens
                     quota_hit_this_round = True
                     last_quota_error = e
                     log.warning(
-                        "⚠️ %s 第 %d 次失败：当前 token 触发 Qwen 配额限制，切换下一个 token。轮次=%d/%d，token=%d/%d | 原始错误：%s",
+                        "⚠️ %s 第 %d 次失败：当前 token 触发 %s 配额限制，切换下一个 token。轮次=%d/%d，token=%d/%d | 原始错误：%s",
                         task_label,
                         attempt,
+                        model_name,
                         quota_round,
                         max_quota_rounds,
                         token_index,
-                        len(active_tokens),
+                        total_tokens,
                         e,
                     )
                     if has_next_token:
@@ -3449,17 +3578,60 @@ def _run_qwen_task_with_token_rotation(task_label, token_pool, attempt, runner, 
 
     raise RuntimeError(
         f"{task_label} 在连续 {max_quota_rounds} 轮切换全部 token 后，仍然触发 "
-        f"Qwen/Qwen3.5-397B-A17B 配额限制，停止运行。最后错误：{last_quota_error}"
+        f"{model_name} 配额限制，停止运行。最后错误：{last_quota_error}"
     ) from last_quota_error
 
 
-def _build_youtube_cover_draw_prompt(book_name, book_desc, current_token, attempt):
-    from openai import OpenAI
+def _run_text_task_with_model_fallback(task_label, token_pool, attempt, runner, model_sequence=None):
+    base_tokens = _get_modelscope_active_tokens(token_pool)
+    if not base_tokens:
+        raise ValueError(f"{task_label} 未提供可用的 ModelScope Token。")
 
-    client = OpenAI(
-        base_url='https://api-inference.modelscope.cn/v1',
-        api_key=current_token,
-    )
+    resolved_model_sequence = list(model_sequence or _get_modelscope_text_model_sequence())
+    collected_errors = []
+
+    for model_index, model_name in enumerate(resolved_model_sequence, start=1):
+        model_token_pool = clone_modelscope_token_pool(base_tokens)
+        try:
+            result, model_errors = _run_qwen_task_with_token_rotation(
+                task_label=task_label,
+                token_pool=model_token_pool,
+                attempt=attempt,
+                runner=lambda current_token, current_model=model_name: runner(current_token, current_model),
+                model_name=model_name,
+                invalid_token_pool=token_pool,
+            )
+        except RuntimeError as e:
+            collected_errors.append(f"{model_name}: {e}")
+            if model_index < len(resolved_model_sequence):
+                next_model_name = resolved_model_sequence[model_index]
+                log.warning(
+                    "⚠️ %s 在当前全部可用 token 上触发 %s 配额限制，开始自动切换到 %s 再完整重试一轮。",
+                    task_label,
+                    model_name,
+                    next_model_name,
+                )
+                continue
+            raise
+
+        if model_errors:
+            collected_errors.extend([f"{model_name}: {msg}" for msg in model_errors])
+        if result is not None:
+            return result, collected_errors
+
+        if model_index < len(resolved_model_sequence):
+            next_model_name = resolved_model_sequence[model_index]
+            log.warning(
+                "⚠️ %s 在当前全部可用 token 上都生成失败，开始自动切换到 %s 再完整重试一轮。",
+                task_label,
+                next_model_name,
+            )
+
+    return None, collected_errors
+
+
+def _build_youtube_cover_draw_prompt(book_name, book_desc, current_token, attempt, text_model):
+    client = _create_modelscope_openai_client(current_token)
 
     system_prompt = """角色设定：你是一位顶级 YouTube 封面设计师和 AI 绘图提示词专家。你的任务是根据我提供的书名和简介，输出一段可直接用于高质量文生图模型的英文提示词。
 
@@ -3477,31 +3649,18 @@ def _build_youtube_cover_draw_prompt(book_name, book_desc, current_token, attemp
     user_prompt = f"书名：[{book_name}]\n简介：[{book_desc}]"
 
     response = client.chat.completions.create(
-        model='Qwen/Qwen3.5-397B-A17B',
+        model=text_model,
         messages=[
             {'role': 'system', 'content': system_prompt},
             {'role': 'user', 'content': user_prompt}
         ]
     )
 
-    choices = getattr(response, "choices", None) or []
-    first_choice = choices[0] if choices else None
-    message = getattr(first_choice, "message", None)
-    content = getattr(message, "content", None)
-    if isinstance(content, list):
-        merged_parts = []
-        for item in content:
-            if isinstance(item, dict):
-                merged_parts.append(str(item.get("text") or item.get("content") or ""))
-            else:
-                merged_parts.append(str(getattr(item, "text", "") or getattr(item, "content", "") or ""))
-        content = "".join(merged_parts)
-
-    draw_prompt = str(content or "").strip()
+    draw_prompt = _extract_modelscope_chat_content(response)
     if not draw_prompt:
         raise ValueError("封面提示词接口未返回有效文本内容。")
 
-    log.info("🎨 第 %d 次绘画请求 | 大模型已凝练出绝佳画面神韵：\n%s", attempt, draw_prompt)
+    log.info("🎨 第 %d 次绘画请求 | 文字模型=%s\n%s", attempt, text_model, draw_prompt)
     return draw_prompt
 
 
@@ -3561,7 +3720,7 @@ def _request_modelscope_cover_image_url(image_model, current_token, draw_prompt,
     raise ValueError(f"由于排队压力，远端在 {max_polls * poll_interval} 秒内仍未完成绘图。")
 
 
-def _try_generate_cover_with_image_model(output_path, draw_prompt, img_size, image_model, token_candidates):
+def _try_generate_cover_with_image_model(output_path, draw_prompt, img_size, image_model, token_candidates, invalid_token_pool=None):
     active_tokens = _get_modelscope_active_tokens(token_candidates)
     if not active_tokens:
         return {
@@ -3601,6 +3760,22 @@ def _try_generate_cover_with_image_model(output_path, draw_prompt, img_size, ima
 
             failure_count += 1
             failure_messages.append(str(e))
+            if is_modelscope_http_401_error(e):
+                _remove_modelscope_token_from_pool(token_candidates, current_token)
+                _remove_modelscope_token_from_pool(invalid_token_pool, current_token)
+                has_next_token = token_index < len(round_tokens)
+                _log_modelscope_token_401(
+                    task_label=f"{image_model} 生图",
+                    current_token=current_token,
+                    error=e,
+                    token_index=token_index,
+                    total_tokens=len(round_tokens),
+                    model_name=image_model,
+                )
+                if has_next_token:
+                    _sleep_before_next_modelscope_token()
+                continue
+
             if is_modelscope_http_429_error(e):
                 _remove_modelscope_token_from_pool(token_candidates, current_token)
                 active_tokens = _get_modelscope_active_tokens(token_candidates)
@@ -3635,9 +3810,12 @@ def _try_generate_cover_with_image_model(output_path, draw_prompt, img_size, ima
 
 
 def auto_create_youtube_cover(book_name, book_desc, output_path, token, resolution="1080p"):
-    token_pool = _get_modelscope_active_tokens(token)
-    if not token_pool:
-        raise ValueError("未提供 ModelScope Token，无法生成 AI 海报。")
+    text_token_pool = _get_modelscope_usage_token_pool(token, "text")
+    image_token_pool = _get_modelscope_usage_token_pool(token, "image")
+    if not text_token_pool:
+        raise ValueError("未提供 ModelScope 文字 Token，无法生成 AI 海报。")
+    if not image_token_pool:
+        raise ValueError("未提供 ModelScope 生图 Token，无法生成 AI 海报。")
 
     res_to_size = {"720p": "1280x720", "1080p": "1920x1080", "1440p": "2560x1440", "4k": "3840x2160"}
     img_size = res_to_size.get(str(resolution).lower(), "1920x1080")
@@ -3647,6 +3825,7 @@ def auto_create_youtube_cover(book_name, book_desc, output_path, token, resoluti
     attempt = 0
     prompt_generation_attempt = 0
     cached_draw_prompt = ""
+    text_model_sequence = _get_modelscope_text_model_sequence()
     image_model_sequence = [
         ("qwen/Qwen-Image-2512", "主生图模型"),
         ("Tongyi-MAI/Z-Image-Turbo", "回退生图模型"),
@@ -3658,16 +3837,18 @@ def auto_create_youtube_cover(book_name, book_desc, output_path, token, resoluti
         draw_prompt = cached_draw_prompt
         if not draw_prompt:
             prompt_generation_attempt += 1
-            draw_prompt, prompt_errors = _run_qwen_task_with_token_rotation(
+            draw_prompt, prompt_errors = _run_text_task_with_model_fallback(
                 task_label="封面提示词生成",
-                token_pool=token_pool,
+                token_pool=text_token_pool,
                 attempt=prompt_generation_attempt,
-                runner=lambda current_token: _build_youtube_cover_draw_prompt(
+                runner=lambda current_token, current_model: _build_youtube_cover_draw_prompt(
                     book_name,
                     book_desc,
                     current_token,
                     prompt_generation_attempt,
+                    current_model,
                 ),
+                model_sequence=text_model_sequence,
             )
             if prompt_errors:
                 current_cycle_errors.extend([f"prompt: {msg}" for msg in prompt_errors])
@@ -3693,7 +3874,8 @@ def auto_create_youtube_cover(book_name, book_desc, output_path, token, resoluti
                 draw_prompt=draw_prompt,
                 img_size=img_size,
                 image_model=image_model,
-                token_candidates=token_pool,
+                token_candidates=clone_modelscope_token_pool(image_token_pool),
+                invalid_token_pool=image_token_pool,
             )
             if model_result["success"]:
                 return True
@@ -3726,22 +3908,18 @@ def auto_create_youtube_cover(book_name, book_desc, output_path, token, resoluti
 
 
 def auto_create_youtube_seo(book_name, book_desc, output_path, token):
-    token_pool = _get_modelscope_active_tokens(token)
-    if not token_pool:
-        raise ValueError("未提供 ModelScope Token，无法生成 SEO 文案。")
+    text_token_pool = _get_modelscope_usage_token_pool(token, "text")
+    if not text_token_pool:
+        raise ValueError("未提供 ModelScope 文字 Token，无法生成 SEO 文案。")
 
     log.info("【📝 AI文案大师】[%s] 分析书籍内容以撰写 YouTube SEO 最优化简介...", book_name)
 
     attempt = 0
+    text_model_sequence = _get_modelscope_text_model_sequence()
     while True:
         attempt += 1
-        def _generate_seo_dict(current_token):
-            from openai import OpenAI
-
-            client = OpenAI(
-                base_url='https://api-inference.modelscope.cn/v1',
-                api_key=current_token,
-            )
+        def _generate_seo_dict(current_token, text_model):
+            client = _create_modelscope_openai_client(current_token)
 
             system_prompt = """角色设定：
 你现在是一位千万粉丝级别的 YouTube 运营专员与 SEO 大师。
@@ -3759,29 +3937,23 @@ JSON 必须严格有且只有以下三个 key：
             user_prompt = f"书名：[{book_name}]\n简介：[{book_desc}]"
 
             response = client.chat.completions.create(
-                model='Qwen/Qwen3.5-397B-A17B',
+                model=text_model,
                 messages=[
                     {'role': 'system', 'content': system_prompt},
                     {'role': 'user', 'content': user_prompt}
                 ]
             )
 
-            llm_reply = response.choices[0].message.content.strip()
-            if llm_reply.startswith("```json"):
-                llm_reply = llm_reply[7:]
-            if llm_reply.startswith("```"):
-                llm_reply = llm_reply[3:]
-            if llm_reply.endswith("```"):
-                llm_reply = llm_reply[:-3]
-            llm_reply = llm_reply.strip()
+            llm_reply = _strip_markdown_code_fences(_extract_modelscope_chat_content(response))
 
             return json.loads(llm_reply)
 
-        seo_dict, generation_errors = _run_qwen_task_with_token_rotation(
+        seo_dict, generation_errors = _run_text_task_with_model_fallback(
             task_label="SEO 文案生成",
-            token_pool=token_pool,
+            token_pool=text_token_pool,
             attempt=attempt,
             runner=_generate_seo_dict,
+            model_sequence=text_model_sequence,
         )
 
         if seo_dict:
@@ -5088,11 +5260,11 @@ def prepare_book_cover_and_seo(result, book_data, book_dir, safe_name, book_name
             log.info("[%s] 复用已生成的 SEO 文案。", book_name)
 
     needs_modelscope_token = (ENABLE_COVER_GENERATION and not ai_cover_ready) or (ENABLE_SEO_GENERATION and not seo_ready)
-    token_pool = []
+    token_pool = {}
     if needs_modelscope_token:
         resolved_modelscope_token = resolve_modelscope_token(str(YOUTUBE_CHANNEL_NAME).strip())
-        token_pool = build_modelscope_token_pool(resolved_modelscope_token, shuffle_once=True)
-        if not token_pool:
+        token_pool = build_modelscope_token_pool_bundle(resolved_modelscope_token, shuffle_once=True)
+        if not any(token_pool.values()):
             raise RuntimeError("未能解析出可用的 ModelScope Token，无法继续 AI 生成。")
 
     if ENABLE_COVER_GENERATION and not ai_cover_ready:
