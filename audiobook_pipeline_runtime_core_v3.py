@@ -2009,6 +2009,316 @@ def _truncate_split_state_debug_value(value, limit=240):
     return text[:limit] + "...<truncated>"
 
 
+def _extract_youtube_video_id(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", text):
+        return text
+
+    try:
+        parsed = urlparse(text)
+        host = (parsed.netloc or "").lower()
+        if "youtu.be" in host:
+            return parsed.path.strip("/").split("/")[0]
+        if "youtube.com" in host:
+            query_id = parse_qs(parsed.query).get("v", [""])[0].strip()
+            if query_id:
+                return query_id
+            parts = [part for part in parsed.path.split("/") if part]
+            if "embed" in parts:
+                idx = parts.index("embed")
+                if idx + 1 < len(parts):
+                    return parts[idx + 1]
+            if "shorts" in parts:
+                idx = parts.index("shorts")
+                if idx + 1 < len(parts):
+                    return parts[idx + 1]
+    except Exception:
+        return ""
+
+    return ""
+
+
+def _fetch_video_rows_by_id_with_client(youtube, video_ids):
+    normalized_ids = []
+    seen_ids = set()
+    for value in video_ids or []:
+        video_id = _extract_youtube_video_id(value)
+        if not video_id or video_id in seen_ids:
+            continue
+        seen_ids.add(video_id)
+        normalized_ids.append(video_id)
+
+    if not normalized_ids:
+        return {}
+
+    rows_by_id = {}
+    for row in _fetch_video_status_rows_with_client(youtube, normalized_ids):
+        video_id = str(row.get("id") or "").strip()
+        if video_id:
+            rows_by_id[video_id] = row
+    return rows_by_id
+
+
+def _wait_for_live_video_rows_with_client(youtube, video_ids, max_attempts=3, context_label=""):
+    ordered_ids = []
+    seen_ids = set()
+    for value in video_ids or []:
+        video_id = _extract_youtube_video_id(value)
+        if not video_id or video_id in seen_ids:
+            continue
+        seen_ids.add(video_id)
+        ordered_ids.append(video_id)
+
+    if not ordered_ids:
+        return {}, []
+
+    max_attempts = max(1, int(max_attempts or 1))
+    rows_by_id = {}
+    missing_ids = list(ordered_ids)
+    for attempt_index in range(1, max_attempts + 1):
+        rows_by_id = _fetch_video_rows_by_id_with_client(youtube, ordered_ids)
+        missing_ids = [video_id for video_id in ordered_ids if video_id not in rows_by_id]
+        if not missing_ids or attempt_index >= max_attempts:
+            break
+
+        wait_seconds = min(10, 1 + attempt_index)
+        if context_label:
+            log.warning(
+                "[%s] Waiting for YouTube videos to become readable. attempt=%d/%d missing=%s sleep=%ds",
+                context_label,
+                attempt_index,
+                max_attempts,
+                ",".join(missing_ids[:10]),
+                wait_seconds,
+            )
+        else:
+            log.warning(
+                "Waiting for YouTube videos to become readable. attempt=%d/%d missing=%s sleep=%ds",
+                attempt_index,
+                max_attempts,
+                ",".join(missing_ids[:10]),
+                wait_seconds,
+            )
+        time.sleep(wait_seconds)
+
+    return rows_by_id, missing_ids
+
+
+def _apply_video_match_to_split_part(part_state, match):
+    if not isinstance(part_state, dict) or not isinstance(match, dict):
+        return False
+
+    changed = False
+    old_video_id = str(part_state.get("video_id") or "").strip()
+    updated_values = {
+        "video_id": str(match.get("video_id") or "").strip(),
+        "youtube_url": str(match.get("youtube_url") or "").strip(),
+        "uploaded_at": str(match.get("uploaded_at") or "").strip(),
+        "publish_at": str(match.get("publish_at") or "").strip(),
+        "schedule_reason": str(match.get("schedule_reason") or "").strip(),
+    }
+    resolved_title = str(match.get("title") or part_state.get("youtube_title") or "").strip()
+    if resolved_title:
+        updated_values["youtube_title"] = resolved_title
+
+    for key, value in updated_values.items():
+        if str(part_state.get(key) or "").strip() == value:
+            continue
+        part_state[key] = value
+        changed = True
+
+    if old_video_id and old_video_id != updated_values.get("video_id", "") and str(part_state.get("playlist_item_id") or "").strip():
+        part_state["playlist_item_id"] = ""
+        changed = True
+
+    if _split_part_has_uploaded_video(part_state):
+        if str(part_state.get("status") or "").strip().lower() != "completed":
+            part_state["status"] = "completed"
+            changed = True
+        if not str(part_state.get("completed_at") or "").strip():
+            part_state["completed_at"] = dt_module.datetime.now().isoformat()
+            changed = True
+        if str(part_state.get("last_stage") or "").strip() != "completed":
+            part_state["last_stage"] = "completed"
+            changed = True
+        if str(part_state.get("error") or "").strip():
+            part_state["error"] = ""
+            changed = True
+
+    return changed
+
+
+def _reset_split_part_upload_state(part_state, reason=""):
+    if not isinstance(part_state, dict):
+        return False
+
+    changed = False
+    for key in ["video_id", "youtube_url", "uploaded_at", "publish_at", "schedule_reason", "playlist_item_id"]:
+        if not str(part_state.get(key) or "").strip():
+            continue
+        part_state[key] = ""
+        changed = True
+
+    if str(part_state.get("status") or "").strip().lower() != "pending":
+        part_state["status"] = "pending"
+        changed = True
+    if str(part_state.get("completed_at") or "").strip():
+        part_state["completed_at"] = ""
+        changed = True
+    if str(part_state.get("last_stage") or "").strip() != "upload_recovery_pending":
+        part_state["last_stage"] = "upload_recovery_pending"
+        changed = True
+
+    normalized_reason = str(reason or "").strip()
+    if str(part_state.get("error") or "").strip() != normalized_reason:
+        part_state["error"] = normalized_reason
+        changed = True
+
+    return changed
+
+
+def _build_expected_split_upload_title(result, book_name, category, part_index, part_count):
+    title, _, _ = build_youtube_payload(
+        result,
+        book_name,
+        category,
+        youtube_chapters="",
+        title_prefix=f"{part_index}-" if int(part_count or 0) > 1 else "",
+        part_hint="",
+        include_youtube_chapters=False,
+        include_part_hint=False,
+    )
+    return str(title or "").strip()[:100]
+
+
+def reconcile_split_part_upload_states(result, state, split_plan, book_name, category):
+    channel_name = str(YOUTUBE_CHANNEL_NAME or "").strip()
+    if not ENABLE_YOUTUBE_UPLOAD or not channel_name:
+        return {"changed": False, "recovered": [], "reset": []}
+
+    part_count = len(split_plan.get("parts", [])) or 1
+    candidates = []
+    candidate_video_ids = []
+    changed = False
+
+    for part_plan in split_plan.get("parts", []):
+        part_state = get_split_part_state(state, part_plan["part_index"])
+        if not isinstance(part_state, dict):
+            continue
+
+        current_status = str(part_state.get("status") or "").strip().lower()
+        candidate_video_id = _extract_youtube_video_id(part_state.get("video_id")) or _extract_youtube_video_id(part_state.get("youtube_url"))
+        has_upload_state = bool(
+            candidate_video_id
+            or str(part_state.get("youtube_url") or "").strip()
+            or str(part_state.get("uploaded_at") or "").strip()
+            or current_status == "completed"
+        )
+        if not has_upload_state:
+            continue
+
+        expected_title = str(part_state.get("youtube_title") or "").strip()
+        if not expected_title:
+            expected_title = _build_expected_split_upload_title(
+                result,
+                book_name,
+                category,
+                part_plan["part_index"],
+                part_count,
+            )
+            if expected_title and str(part_state.get("youtube_title") or "").strip() != expected_title:
+                part_state["youtube_title"] = expected_title
+                changed = True
+
+        candidates.append(
+            {
+                "part_plan": part_plan,
+                "part_state": part_state,
+                "candidate_video_id": candidate_video_id,
+                "expected_title": expected_title,
+            }
+        )
+        if candidate_video_id:
+            candidate_video_ids.append(candidate_video_id)
+
+    if not candidates:
+        return {"changed": changed, "recovered": [], "reset": []}
+
+    youtube = authenticate_youtube_from_supabase(channel_name)
+    if not youtube:
+        return {"changed": changed, "recovered": [], "reset": []}
+
+    live_rows_by_id, _ = _wait_for_live_video_rows_with_client(
+        youtube,
+        candidate_video_ids,
+        max_attempts=2,
+        context_label=book_name,
+    )
+
+    title_index = None
+    recovered = []
+    reset = []
+
+    for candidate in candidates:
+        part_plan = candidate["part_plan"]
+        part_state = candidate["part_state"]
+        part_index = int(part_plan["part_index"])
+        candidate_video_id = candidate["candidate_video_id"]
+        expected_title = candidate["expected_title"]
+
+        if candidate_video_id and candidate_video_id in live_rows_by_id:
+            match = _build_existing_video_match_from_row(live_rows_by_id[candidate_video_id])
+            if expected_title and not str(match.get("title") or "").strip():
+                match["title"] = expected_title
+            if _apply_video_match_to_split_part(part_state, match):
+                changed = True
+            continue
+
+        recovered_match = {}
+        if expected_title:
+            if title_index is None:
+                title_index = _build_channel_video_title_index_with_client(youtube)
+            recovered_match = dict(title_index.get(_normalize_youtube_title_key(expected_title), {})) or {}
+
+        if recovered_match:
+            old_video_id = candidate_video_id
+            if _apply_video_match_to_split_part(part_state, recovered_match):
+                changed = True
+            new_video_id = str(recovered_match.get("video_id") or "").strip()
+            recovered.append((part_index, old_video_id, new_video_id, expected_title))
+            log.warning(
+                "[%s] Split part %d/%d recovered a stale YouTube upload reference by exact title match. old_video_id=%s new_video_id=%s title=%s",
+                book_name,
+                part_index,
+                part_count,
+                old_video_id or "<empty>",
+                new_video_id or "<empty>",
+                expected_title or "<empty>",
+            )
+            continue
+
+        missing_reason = (
+            f"Missing uploaded YouTube video for split part {part_index}/{part_count}: "
+            f"video_id={candidate_video_id or '<empty>'} title={expected_title or '<empty>'}"
+        )
+        if _reset_split_part_upload_state(part_state, reason=missing_reason):
+            changed = True
+        reset.append((part_index, candidate_video_id, expected_title))
+        log.warning(
+            "[%s] Split part %d/%d references a missing YouTube video and will resume from local artifacts before re-upload. video_id=%s title=%s",
+            book_name,
+            part_index,
+            part_count,
+            candidate_video_id or "<empty>",
+            expected_title or "<empty>",
+        )
+
+    return {"changed": changed, "recovered": recovered, "reset": reset}
+
+
 def _build_split_state_debug_payload(book_record, state):
     safe_state = state if isinstance(state, dict) else {}
     safe_book = book_record if isinstance(book_record, dict) else {}
@@ -5063,7 +5373,26 @@ def sync_youtube_playlist(channel_name, title, description, ordered_video_ids, p
         "description": str(description or "")[:5000],
         "privacy_status": normalize_playlist_privacy_status(privacy_status),
         "success": False,
+        "error": "",
     }
+    live_rows_by_id, missing_video_ids = _wait_for_live_video_rows_with_client(
+        youtube,
+        ordered_video_ids,
+        max_attempts=3,
+        context_label=str(title or "").strip()[:80] or "playlist-sync",
+    )
+    if missing_video_ids:
+        playlist_result["error"] = (
+            "One or more uploaded YouTube videos are no longer accessible: "
+            + ",".join(missing_video_ids)
+        )
+        log.error(
+            "Cannot sync YouTube playlist because some uploaded videos are missing. title=%s missing_video_ids=%s",
+            str(title or "").strip()[:150],
+            ",".join(missing_video_ids),
+        )
+        return playlist_result
+
     original_playlist_id = str(playlist_id or "").strip()
     if not original_playlist_id:
         recovered_playlist = _find_matching_owned_playlist_with_client(
@@ -5083,6 +5412,8 @@ def sync_youtube_playlist(channel_name, title, description, ordered_video_ids, p
             )
 
     for attempt_index in range(2):
+        current_video_id = ""
+        current_action = ""
         try:
             playlist_result = _create_or_update_playlist_with_client(
                 youtube,
@@ -5115,6 +5446,8 @@ def sync_youtube_playlist(channel_name, title, description, ordered_video_ids, p
             existing_video_ids = {item["video_id"] for item in existing_items}
             for video_id in ordered_video_ids:
                 if video_id not in existing_video_ids:
+                    current_video_id = video_id
+                    current_action = "insert"
                     _insert_playlist_video_with_client(youtube, playlist_id, video_id)
 
             latest_items = _list_playlist_items_with_client(youtube, playlist_id)
@@ -5128,6 +5461,8 @@ def sync_youtube_playlist(channel_name, title, description, ordered_video_ids, p
                 if not item:
                     continue
                 if int(item.get("position", -1)) != position:
+                    current_video_id = video_id
+                    current_action = "reorder"
                     _update_playlist_item_position_with_client(
                         youtube,
                         playlist_item_id=item["playlist_item_id"],
@@ -5408,45 +5743,21 @@ def persist_split_shared_assets_to_state(book_record, state, result, book_dir, s
 
 
 def build_ordered_split_video_records(state, split_plan):
-    def _extract_video_id(value):
-        text = str(value or "").strip()
-        if not text:
-            return ""
-
-        try:
-            parsed = urlparse(text)
-            host = (parsed.netloc or "").lower()
-            if "youtu.be" in host:
-                return parsed.path.strip("/").split("/")[0]
-            if "youtube.com" in host:
-                query_id = parse_qs(parsed.query).get("v", [""])[0].strip()
-                if query_id:
-                    return query_id
-                parts = [part for part in parsed.path.split("/") if part]
-                if "embed" in parts:
-                    idx = parts.index("embed")
-                    if idx + 1 < len(parts):
-                        return parts[idx + 1]
-        except Exception:
-            return ""
-
-        return ""
-
     records = []
     for part_plan in split_plan.get("parts", []):
         part_state = get_split_part_state(state, part_plan["part_index"]) or {}
         video_id = str(part_state.get("video_id") or "").strip()
         youtube_url = str(part_state.get("youtube_url") or "").strip()
         if not video_id and youtube_url:
-            video_id = _extract_video_id(youtube_url)
-        if not video_id or not youtube_url:
+            video_id = _extract_youtube_video_id(youtube_url)
+        if not video_id:
             continue
 
         records.append(
             {
                 "part_index": part_plan["part_index"],
                 "video_id": video_id,
-                "youtube_url": youtube_url,
+                "youtube_url": youtube_url or f"https://youtu.be/{video_id}",
                 "youtube_title": str(part_state.get("youtube_title") or ""),
                 "uploaded_at": str(part_state.get("uploaded_at") or ""),
             }
@@ -5517,7 +5828,10 @@ def sync_split_playlist(result, state, split_plan, book_record, book_name):
         save_split_processing_state(book_record, state)
 
     if not sync_result or not sync_result.get("success", False):
-        raise RuntimeError("YouTube 播放列表同步失败")
+        sync_error = ""
+        if isinstance(sync_result, dict):
+            sync_error = str(sync_result.get("error") or "").strip()
+        raise RuntimeError(sync_error or "YouTube 播放列表同步失败")
 
     playlist_state["playlist_id"] = sync_result.get("playlist_id", "")
     playlist_state["playlist_url"] = sync_result.get("playlist_url", "")
@@ -6244,6 +6558,30 @@ def process_split_book(result, book_record, book_data, chapters_sorted, book_dir
     prepare_book_cover_and_seo(result, book_data, book_dir, safe_name, book_name)
     state_ref = persist_split_shared_assets_to_state(book_record, state, result, book_dir, safe_name, book_name)
     result.state_path = state_ref
+
+    reconcile_summary = reconcile_split_part_upload_states(result, state, split_plan, book_name, category)
+    if reconcile_summary.get("changed"):
+        recovered_parts = [str(item[0]) for item in reconcile_summary.get("recovered", [])]
+        reset_parts = [str(item[0]) for item in reconcile_summary.get("reset", [])]
+        if reset_parts:
+            playlist_state = get_split_playlist_state(state)
+            playlist_state["status"] = "pending"
+            playlist_state["last_error"] = "Waiting for split parts to be re-uploaded after stale video recovery."
+            playlist_state["video_ids"] = []
+        state["last_stage"] = "resume_reconciled"
+        if reset_parts:
+            state["last_error"] = "Reset stale uploaded YouTube references for split parts: " + ",".join(reset_parts)
+        else:
+            state["last_error"] = ""
+        state_ref = save_split_processing_state(book_record, state)
+        result.state_path = state_ref
+        log.info(
+            "[%s] Resume reconciliation finished. recovered_parts=%s reset_parts=%s state=%s",
+            book_name,
+            ",".join(recovered_parts) if recovered_parts else "<none>",
+            ",".join(reset_parts) if reset_parts else "<none>",
+            state_ref,
+        )
 
     playlist_required = bool(result.part_count > 1 and ENABLE_YOUTUBE_UPLOAD and str(YOUTUBE_CHANNEL_NAME).strip())
     playlist_state = get_split_playlist_state(state)
