@@ -4423,6 +4423,7 @@ except Exception:
 YOUTUBE_DAILY_PUBLISH_LIMIT = max(1, int(globals().get("YOUTUBE_DAILY_PUBLISH_LIMIT", 3) or 3))
 YOUTUBE_TITLE_MATCH_CACHE = {}
 YOUTUBE_LOCALIZATION_CONVERTER_CACHE = {}
+YOUTUBE_LOCALIZATION_INSTALL_ATTEMPTED = set()
 
 
 def get_youtube_default_language():
@@ -4446,16 +4447,52 @@ def get_youtube_traditional_opencc_config():
 
 def _get_youtube_localization_converter():
     config_name = get_youtube_traditional_opencc_config()
-    cached = YOUTUBE_LOCALIZATION_CONVERTER_CACHE.get(config_name)
-    if cached is not None:
-        return cached
+    if config_name in YOUTUBE_LOCALIZATION_CONVERTER_CACHE:
+        cached = YOUTUBE_LOCALIZATION_CONVERTER_CACHE.get(config_name)
+        return cached or None
 
     try:
         from opencc import OpenCC
     except ImportError as exc:
-        raise RuntimeError(
-            "Traditional Chinese localization requires the 'opencc-python-reimplemented' package."
-        ) from exc
+        if config_name not in YOUTUBE_LOCALIZATION_INSTALL_ATTEMPTED:
+            YOUTUBE_LOCALIZATION_INSTALL_ATTEMPTED.add(config_name)
+            try:
+                import sys as _sys
+
+                log.warning(
+                    "Missing opencc for zh-TW localization. Attempting automatic install: opencc-python-reimplemented"
+                )
+                install_result = subprocess.run(
+                    [_sys.executable, "-m", "pip", "install", "-q", "opencc-python-reimplemented"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                if install_result.returncode == 0:
+                    from opencc import OpenCC
+
+                    log.info("Installed opencc-python-reimplemented automatically for zh-TW localization.")
+                else:
+                    detail = (install_result.stderr or install_result.stdout or "").strip()[-500:]
+                    log.warning(
+                        "Automatic OpenCC install failed. zh-TW localization will be skipped for this run: %s",
+                        detail or "no pip output",
+                    )
+                    YOUTUBE_LOCALIZATION_CONVERTER_CACHE[config_name] = False
+                    return None
+            except Exception as install_error:
+                log.warning(
+                    "Unable to auto-install OpenCC. zh-TW localization will be skipped for this run: %s",
+                    install_error,
+                )
+                YOUTUBE_LOCALIZATION_CONVERTER_CACHE[config_name] = False
+                return None
+        else:
+            log.warning(
+                "OpenCC is unavailable and auto-install already failed earlier in this run. zh-TW localization will be skipped."
+            )
+            YOUTUBE_LOCALIZATION_CONVERTER_CACHE[config_name] = False
+            return None
 
     converter = OpenCC(config_name)
     YOUTUBE_LOCALIZATION_CONVERTER_CACHE[config_name] = converter
@@ -4477,6 +4514,8 @@ def build_youtube_traditional_localizations(title="", description=""):
         return default_language, {}
 
     converter = _get_youtube_localization_converter()
+    if converter is None:
+        return default_language, {}
     return default_language, {
         target_locale: {
             "title": converter.convert(normalized_title),
