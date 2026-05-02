@@ -52,6 +52,7 @@ DEFAULT_RUNTIME_CONFIG = {'POSTGRES_DSN': '',
  'ENABLE_YOUTUBE_TRADITIONAL_LOCALIZATION': True,
  'YOUTUBE_TRADITIONAL_LOCALE': 'zh-TW',
  'YOUTUBE_TRADITIONAL_OPENCC_CONFIG': 's2t',
+ 'ENABLE_AUTO_INSTALL_OPENCC': True,
  'APPEND_TAGS_TO_TITLE': False,
  'APPEND_TAGS_TO_DESC': True,
  'ENABLE_VIDEO_GENERATION': True,
@@ -4445,6 +4446,10 @@ def get_youtube_traditional_opencc_config():
     return value or "s2t"
 
 
+def youtube_traditional_opencc_auto_install_enabled():
+    return bool(globals().get("ENABLE_AUTO_INSTALL_OPENCC", True))
+
+
 def _get_youtube_localization_converter():
     config_name = get_youtube_traditional_opencc_config()
     if config_name in YOUTUBE_LOCALIZATION_CONVERTER_CACHE:
@@ -4454,6 +4459,12 @@ def _get_youtube_localization_converter():
     try:
         from opencc import OpenCC
     except ImportError as exc:
+        if not youtube_traditional_opencc_auto_install_enabled():
+            log.warning(
+                "OpenCC is unavailable and ENABLE_AUTO_INSTALL_OPENCC is disabled. zh-TW localization will be skipped."
+            )
+            YOUTUBE_LOCALIZATION_CONVERTER_CACHE[config_name] = False
+            return None
         if config_name not in YOUTUBE_LOCALIZATION_INSTALL_ATTEMPTED:
             YOUTUBE_LOCALIZATION_INSTALL_ATTEMPTED.add(config_name)
             try:
