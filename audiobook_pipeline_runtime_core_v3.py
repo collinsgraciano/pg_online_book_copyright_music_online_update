@@ -2749,11 +2749,36 @@ def list_interrupted_book_states(book_rows_by_id=None):
 
         for row in rows:
             state = normalize_split_state_from_row(row)
-            if state.get("mode") != "split_upload":
+            state_mode = str(state.get("mode") or "").strip().lower()
+            if state_mode not in {"split_upload", "standard_upload"}:
                 continue
 
             book_id = str(state.get("book_id") or "").strip()
             if not book_id:
+                continue
+
+            book_record = book_rows_by_id.get(book_id, {})
+            already_processed = _book_has_project_status(book_record, project_flag=project_flag)
+
+            if state_mode == "standard_upload":
+                if already_processed:
+                    try:
+                        if delete_split_processing_state({"book_id": book_id}, only_if_completed=False):
+                            log.info(
+                                "[%s] 检测到 books.status 已包含当前频道，已补删残留的单 P book_processing_states。",
+                                state.get("book_name") or book_id,
+                            )
+                    except Exception as delete_error:
+                        log.warning(
+                            "[%s] books.status 已标记成功，但补删残留单 P book_processing_states 失败: %s",
+                            state.get("book_name") or book_id,
+                            delete_error,
+                        )
+                    continue
+
+                existing = states.get(book_id)
+                if not existing or str(state.get("updated_at", "")) > str(existing.get("updated_at", "")):
+                    states[book_id] = state
                 continue
 
             progress = evaluate_split_completion_state(state)
@@ -2761,9 +2786,6 @@ def list_interrupted_book_states(book_rows_by_id=None):
             state["part_count"] = progress["part_count"]
             state["status"] = "completed" if progress["fully_completed"] else "in_progress"
             state["pending_resume"] = not progress["fully_completed"]
-
-            book_record = book_rows_by_id.get(book_id, {})
-            already_processed = _book_has_project_status(book_record, project_flag=project_flag)
             if already_processed and progress["fully_completed"]:
                 try:
                     if delete_split_processing_state({"book_id": book_id}, only_if_completed=False):
@@ -5742,6 +5764,39 @@ def persist_split_shared_assets_to_state(book_record, state, result, book_dir, s
     return state_ref
 
 
+def build_standard_processing_state(book_record):
+    existing = load_split_processing_state(book_record) or {}
+    existing_mode = str(existing.get("mode") or "").strip().lower() if isinstance(existing, dict) else ""
+    existing_shared_assets = existing.get("shared_assets") if isinstance(existing.get("shared_assets"), dict) else {}
+    now = dt_module.datetime.now().isoformat()
+
+    return {
+        "state_version": 5,
+        "mode": "standard_upload",
+        "book_id": str(book_record.get("book_id", "")),
+        "book_name": book_record.get("book_name", ""),
+        "category": book_record.get("category", ""),
+        "part_count": 1,
+        "parts": [],
+        "shared_assets": existing_shared_assets,
+        "last_stage": existing.get("last_stage", "standard_assets_pending") if existing_mode == "standard_upload" else "standard_assets_pending",
+        "last_error": existing.get("last_error", "") if existing_mode == "standard_upload" else "",
+        "pending_resume": True,
+        "created_at": existing.get("created_at") if existing_mode == "standard_upload" else now,
+    }
+
+
+def prepare_standard_book_cover_and_seo_with_state(result, book_record, book_data, book_dir, safe_name, book_name):
+    state = build_standard_processing_state(book_record)
+    restore_split_shared_assets_from_state(result, state, book_dir, safe_name, book_name)
+    prepare_book_cover_and_seo(result, book_data, book_dir, safe_name, book_name)
+    state["last_stage"] = "standard_shared_assets_ready"
+    state["last_error"] = ""
+    state_ref = persist_split_shared_assets_to_state(book_record, state, result, book_dir, safe_name, book_name)
+    result.state_path = state_ref
+    return state_ref, state
+
+
 def build_ordered_split_video_records(state, split_plan):
     records = []
     for part_plan in split_plan.get("parts", []):
@@ -6122,7 +6177,14 @@ def process_standard_book(result, book_record, book_data, chapters_sorted, book_
     else:
         result.success_count = result.chapter_count
 
-    prepare_book_cover_and_seo(result, book_data, book_dir, safe_name, book_name)
+    prepare_standard_book_cover_and_seo_with_state(
+        result,
+        book_record,
+        book_data,
+        book_dir,
+        safe_name,
+        book_name,
+    )
 
     if ENABLE_VIDEO_GENERATION:
         video_path = os.path.join(book_dir, f"{safe_name}_final.mp4")
@@ -6779,7 +6841,14 @@ def process_book(book_record: dict, run_started_at=None) -> BookResult:
         if SKIP_EXISTING and os.path.exists(final_path) and os.path.getsize(final_path) > 0:
             result.merged_audio_path = final_path
             result.audio_ready = True
-            prepare_book_cover_and_seo(result, book_data, book_dir, safe_name, book_name)
+            prepare_standard_book_cover_and_seo_with_state(
+                result,
+                book_record,
+                book_data,
+                book_dir,
+                safe_name,
+                book_name,
+            )
         else:
             result.error = "chapters_data 为空或无效，且不存在可复用的成品音频"
         return finish()
@@ -6878,11 +6947,14 @@ def finalize_successful_book_for_project(book_record, result, book_name, flag):
             result.error = f"Output finished, but updating books.status failed: {e}"
         return False
 
-    if getattr(result, "split_mode", False):
+    if getattr(result, "split_mode", False) or str(getattr(result, "state_path", "") or "").strip():
         try:
             if delete_split_processing_state(book_record, only_if_completed=False):
                 result.state_path = ""
-                log.info("[%s] Split upload finalized and book_processing_states deleted.", book_name)
+                if getattr(result, "split_mode", False):
+                    log.info("[%s] Split upload finalized and book_processing_states deleted.", book_name)
+                else:
+                    log.info("[%s] Standard upload finalized and book_processing_states deleted.", book_name)
         except Exception as e:
             log.error(
                 "[%s] books.status updated, but deleting book_processing_states failed; startup cleanup will retry: %s",
@@ -6957,7 +7029,7 @@ def run_pipeline(runtime_config: dict | None = None):
                 reverse=True,
             )
             all_books = interrupted_books + fresh_books
-            log.info("Prioritizing %d interrupted or finalize-only split books.", len(interrupted_books))
+            log.info("Prioritizing %d interrupted books with saved processing state.", len(interrupted_books))
         else:
             all_books = fresh_books + interrupted_books
             random.shuffle(all_books)
