@@ -51,6 +51,7 @@ DEFAULT_RUNTIME_CONFIG = {'POSTGRES_DSN': '',
  'YOUTUBE_DEFAULT_LANGUAGE': 'zh-CN',
  'YOUTUBE_DEFAULT_AUDIO_LANGUAGE': 'zh-Hant',
  'ENABLE_YOUTUBE_TRADITIONAL_LOCALIZATION': True,
+ 'YOUTUBE_LOCALIZATION_LOCALES': 'zh-TW,zh-HK,zh-SG,zh-Hant',
  'YOUTUBE_TRADITIONAL_LOCALE': 'zh-TW',
  'YOUTUBE_TRADITIONAL_OPENCC_CONFIG': 's2t',
  'ENABLE_AUTO_INSTALL_OPENCC': True,
@@ -4444,6 +4445,22 @@ def youtube_traditional_localization_enabled():
     return bool(globals().get("ENABLE_YOUTUBE_TRADITIONAL_LOCALIZATION", True))
 
 
+def get_youtube_localization_locales():
+    raw_value = str(globals().get("YOUTUBE_LOCALIZATION_LOCALES", "") or "").strip()
+    if not raw_value:
+        raw_value = get_youtube_traditional_locale()
+
+    default_language = get_youtube_default_language()
+    locales = []
+    for chunk in raw_value.replace("\r", "\n").split("\n"):
+        for part in chunk.split(","):
+            locale = str(part or "").strip()
+            if not locale or locale == default_language or locale in locales:
+                continue
+            locales.append(locale)
+    return locales
+
+
 def get_youtube_traditional_locale():
     value = str(globals().get("YOUTUBE_TRADITIONAL_LOCALE", "zh-TW") or "zh-TW").strip()
     return value or "zh-TW"
@@ -4458,8 +4475,10 @@ def youtube_traditional_opencc_auto_install_enabled():
     return bool(globals().get("ENABLE_AUTO_INSTALL_OPENCC", True))
 
 
-def _get_youtube_localization_converter():
-    config_name = get_youtube_traditional_opencc_config()
+def _get_youtube_localization_converter(config_name=""):
+    config_name = str(config_name or get_youtube_traditional_opencc_config() or "").strip()
+    if not config_name:
+        return None
     if config_name in YOUTUBE_LOCALIZATION_CONVERTER_CACHE:
         cached = YOUTUBE_LOCALIZATION_CONVERTER_CACHE.get(config_name)
         return cached or None
@@ -4513,9 +4532,60 @@ def _get_youtube_localization_converter():
             YOUTUBE_LOCALIZATION_CONVERTER_CACHE[config_name] = False
             return None
 
-    converter = OpenCC(config_name)
+    converter = _build_opencc_converter_with_fallback(config_name)
     YOUTUBE_LOCALIZATION_CONVERTER_CACHE[config_name] = converter
     return converter
+
+
+def _get_youtube_locale_conversion_config(locale):
+    normalized_locale = str(locale or "").strip()
+    if not normalized_locale:
+        return ""
+    if normalized_locale == "zh-HK":
+        return "s2hk"
+    if normalized_locale in {"zh-TW", "zh-Hant"}:
+        return get_youtube_traditional_opencc_config()
+    return ""
+
+
+def _build_opencc_converter_with_fallback(config_name):
+    try:
+        from opencc import OpenCC
+
+        return OpenCC(config_name)
+    except Exception as exc:
+        fallback_config = get_youtube_traditional_opencc_config()
+        if config_name != fallback_config:
+            try:
+                from opencc import OpenCC
+
+                log.warning(
+                    "OpenCC config %s is unavailable. Falling back to %s for YouTube localization: %s",
+                    config_name,
+                    fallback_config,
+                    exc,
+                )
+                return OpenCC(fallback_config)
+            except Exception:
+                pass
+        raise
+
+
+def _build_youtube_localization_entry_for_locale(locale, normalized_title, normalized_description):
+    conversion_config = _get_youtube_locale_conversion_config(locale)
+    if not conversion_config:
+        return {
+            "title": normalized_title,
+            "description": normalized_description,
+        }
+
+    converter = _get_youtube_localization_converter(conversion_config)
+    if converter is None:
+        return None
+    return {
+        "title": converter.convert(normalized_title),
+        "description": converter.convert(normalized_description),
+    }
 
 
 def build_youtube_traditional_localizations(title="", description=""):
@@ -4528,19 +4598,21 @@ def build_youtube_traditional_localizations(title="", description=""):
     if not normalized_title and not normalized_description:
         return default_language, {}
 
-    target_locale = get_youtube_traditional_locale()
-    if not target_locale or target_locale == default_language:
+    target_locales = get_youtube_localization_locales()
+    if not target_locales:
         return default_language, {}
 
-    converter = _get_youtube_localization_converter()
-    if converter is None:
-        return default_language, {}
-    return default_language, {
-        target_locale: {
-            "title": converter.convert(normalized_title),
-            "description": converter.convert(normalized_description),
-        }
-    }
+    generated = {}
+    for target_locale in target_locales:
+        entry = _build_youtube_localization_entry_for_locale(
+            target_locale,
+            normalized_title,
+            normalized_description,
+        )
+        if entry is None:
+            continue
+        generated[target_locale] = entry
+    return default_language, generated
 
 
 def merge_youtube_localizations(existing_localizations=None, title="", description="", force_overwrite=False):
@@ -4549,12 +4621,14 @@ def merge_youtube_localizations(existing_localizations=None, title="", descripti
     if not generated:
         return default_language, merged, False
 
-    target_locale = next(iter(generated.keys()))
-    if merged.get(target_locale) and not force_overwrite:
-        return default_language, merged, False
-
-    merged[target_locale] = generated[target_locale]
-    return default_language, merged, True
+    changed = False
+    for target_locale, localized_entry in generated.items():
+        if merged.get(target_locale) and not force_overwrite:
+            continue
+        if merged.get(target_locale) != localized_entry:
+            merged[target_locale] = localized_entry
+            changed = True
+    return default_language, merged, changed
 
 
 def _build_youtube_mutable_video_snippet(snippet, default_language=""):
@@ -5582,7 +5656,7 @@ def backfill_youtube_traditional_localizations(
         "video_skipped": 0,
         "playlist_updated": 0,
         "playlist_skipped": 0,
-        "target_locale": get_youtube_traditional_locale(),
+        "target_locales": get_youtube_localization_locales(),
         "default_language": get_youtube_default_language(),
     }
 
@@ -5602,13 +5676,13 @@ def backfill_youtube_traditional_localizations(
             if apply:
                 youtube.videos().update(part="snippet,localizations", body=body).execute()
                 log.info(
-                    "Updated zh-TW localization for video %s: %s",
+                    "Updated Chinese locale localizations for video %s: %s",
                     body.get("id"),
                     str((body.get("snippet") or {}).get("title") or ""),
                 )
             else:
                 log.info(
-                    "Dry-run: video %s would receive zh-TW localization: %s",
+                    "Dry-run: video %s would receive Chinese locale localizations: %s",
                     body.get("id"),
                     str((body.get("snippet") or {}).get("title") or ""),
                 )
@@ -5631,19 +5705,19 @@ def backfill_youtube_traditional_localizations(
             if apply:
                 youtube.playlists().update(part="snippet,localizations", body=body).execute()
                 log.info(
-                    "Updated zh-TW localization for playlist %s: %s",
+                    "Updated Chinese locale localizations for playlist %s: %s",
                     body.get("id"),
                     str((body.get("snippet") or {}).get("title") or ""),
                 )
             else:
                 log.info(
-                    "Dry-run: playlist %s would receive zh-TW localization: %s",
+                    "Dry-run: playlist %s would receive Chinese locale localizations: %s",
                     body.get("id"),
                     str((body.get("snippet") or {}).get("title") or ""),
                 )
             summary["playlist_updated"] += 1
 
-    log.info("YouTube zh-TW localization backfill summary: %s", summary)
+    log.info("YouTube Chinese locale localization backfill summary: %s", summary)
     return summary
 
 
