@@ -4649,6 +4649,15 @@ def _fetch_video_rows_with_localizations_with_client(youtube, video_ids):
     return rows
 
 
+def _fetch_single_video_row_with_localizations_with_client(youtube, video_id):
+    normalized_video_id = str(video_id or "").strip()
+    if not normalized_video_id:
+        return {}
+
+    rows = _fetch_video_rows_with_localizations_with_client(youtube, [normalized_video_id])
+    return dict(rows[0]) if rows else {}
+
+
 def _get_builtin_playlist_ids_with_client(youtube):
     response = youtube.channels().list(part="contentDetails", mine=True, maxResults=1).execute()
     items = response.get("items", [])
@@ -4693,6 +4702,168 @@ def _load_playlist_localizations_with_client(youtube, playlist_id):
     if not items:
         return {}
     return dict(items[0].get("localizations") or {})
+
+
+def _fetch_single_playlist_row_with_localizations_with_client(youtube, playlist_id):
+    normalized_playlist_id = str(playlist_id or "").strip()
+    if not normalized_playlist_id:
+        return {}
+
+    response = youtube.playlists().list(
+        part="snippet,localizations",
+        id=normalized_playlist_id,
+        maxResults=1,
+    ).execute()
+    items = response.get("items", [])
+    return dict(items[0]) if items else {}
+
+
+def _sync_video_localizations_with_client(youtube, video_id, title="", description="", force_overwrite=False):
+    normalized_video_id = str(video_id or "").strip()
+    if not normalized_video_id:
+        return {"applied_locales": [], "skipped_locales": [], "failed_locales": {}}
+
+    video_row = _fetch_single_video_row_with_localizations_with_client(youtube, normalized_video_id)
+    if not video_row:
+        log.warning("Unable to fetch uploaded video row for localization sync: video_id=%s", normalized_video_id)
+        return {"applied_locales": [], "skipped_locales": [], "failed_locales": {}}
+
+    snippet = dict(video_row.get("snippet") or {})
+    effective_title = str(title or snippet.get("title") or "")[:100]
+    effective_description = str(description or snippet.get("description") or "")[:5000]
+    default_language, generated = build_youtube_traditional_localizations(
+        title=effective_title,
+        description=effective_description,
+    )
+    if not generated:
+        return {"applied_locales": [], "skipped_locales": [], "failed_locales": {}}
+
+    base_snippet = _build_youtube_mutable_video_snippet(snippet, default_language=default_language)
+    base_snippet["title"] = effective_title
+    base_snippet["description"] = effective_description
+    current_localizations = dict(video_row.get("localizations") or {})
+    applied_locales = []
+    skipped_locales = []
+    failed_locales = {}
+
+    for target_locale, localized_entry in generated.items():
+        if current_localizations.get(target_locale) and not force_overwrite:
+            skipped_locales.append(target_locale)
+            continue
+        if current_localizations.get(target_locale) == localized_entry:
+            skipped_locales.append(target_locale)
+            continue
+
+        body = {
+            "id": normalized_video_id,
+            "snippet": dict(base_snippet),
+            "localizations": dict(current_localizations),
+        }
+        body["localizations"][target_locale] = localized_entry
+        try:
+            youtube.videos().update(part="snippet,localizations", body=body).execute()
+            current_localizations[target_locale] = localized_entry
+            applied_locales.append(target_locale)
+        except HttpError as e:
+            failed_locales[target_locale] = str(e)
+            log.warning(
+                "Skipping rejected video localization locale=%s video_id=%s title=%s error=%s",
+                target_locale,
+                normalized_video_id,
+                effective_title,
+                e,
+            )
+        except Exception as e:
+            failed_locales[target_locale] = str(e)
+            log.warning(
+                "Video localization sync failed locale=%s video_id=%s title=%s error=%s",
+                target_locale,
+                normalized_video_id,
+                effective_title,
+                e,
+            )
+
+    return {
+        "applied_locales": applied_locales,
+        "skipped_locales": skipped_locales,
+        "failed_locales": failed_locales,
+    }
+
+
+def _sync_playlist_localizations_with_client(youtube, playlist_id, title="", description="", force_overwrite=False):
+    normalized_playlist_id = str(playlist_id or "").strip()
+    if not normalized_playlist_id:
+        return {"applied_locales": [], "skipped_locales": [], "failed_locales": {}}
+
+    playlist_row = _fetch_single_playlist_row_with_localizations_with_client(youtube, normalized_playlist_id)
+    if not playlist_row:
+        log.warning("Unable to fetch playlist row for localization sync: playlist_id=%s", normalized_playlist_id)
+        return {"applied_locales": [], "skipped_locales": [], "failed_locales": {}}
+
+    snippet = dict(playlist_row.get("snippet") or {})
+    effective_title = str(title or snippet.get("title") or "")[:150]
+    effective_description = str(description or snippet.get("description") or "")[:5000]
+    default_language, generated = build_youtube_traditional_localizations(
+        title=effective_title,
+        description=effective_description,
+    )
+    if not generated:
+        return {"applied_locales": [], "skipped_locales": [], "failed_locales": {}}
+
+    base_snippet = {
+        "title": effective_title,
+        "description": effective_description,
+        "defaultLanguage": str(
+            snippet.get("defaultLanguage") or default_language or get_youtube_default_language()
+        ).strip(),
+    }
+    current_localizations = dict(playlist_row.get("localizations") or {})
+    applied_locales = []
+    skipped_locales = []
+    failed_locales = {}
+
+    for target_locale, localized_entry in generated.items():
+        if current_localizations.get(target_locale) and not force_overwrite:
+            skipped_locales.append(target_locale)
+            continue
+        if current_localizations.get(target_locale) == localized_entry:
+            skipped_locales.append(target_locale)
+            continue
+
+        body = {
+            "id": normalized_playlist_id,
+            "snippet": dict(base_snippet),
+            "localizations": dict(current_localizations),
+        }
+        body["localizations"][target_locale] = localized_entry
+        try:
+            youtube.playlists().update(part="snippet,localizations", body=body).execute()
+            current_localizations[target_locale] = localized_entry
+            applied_locales.append(target_locale)
+        except HttpError as e:
+            failed_locales[target_locale] = str(e)
+            log.warning(
+                "Skipping rejected playlist localization locale=%s playlist_id=%s title=%s error=%s",
+                target_locale,
+                normalized_playlist_id,
+                effective_title,
+                e,
+            )
+        except Exception as e:
+            failed_locales[target_locale] = str(e)
+            log.warning(
+                "Playlist localization sync failed locale=%s playlist_id=%s title=%s error=%s",
+                target_locale,
+                normalized_playlist_id,
+                effective_title,
+                e,
+            )
+
+    return {
+        "applied_locales": applied_locales,
+        "skipped_locales": skipped_locales,
+        "failed_locales": failed_locales,
+    }
 
 def authenticate_youtube_from_supabase(channel_name):
     """从数据库获取指定频道的 YouTube Token，并在需要时自动刷新。"""
@@ -5229,7 +5400,7 @@ def build_youtube_status(privacy_status="unlisted", schedule_after_hours=0, publ
 def _build_video_upload_request_body(title, description, tags, privacy_status="unlisted", category_id="", schedule_after_hours=0, publish_at=""):
     tags_list = normalize_youtube_tags(tags)
     normalized_category_id = normalize_youtube_category_id(category_id)
-    default_language, localizations = build_youtube_traditional_localizations(title=title, description=description)
+    default_language, _generated_localizations = build_youtube_traditional_localizations(title=title, description=description)
     snippet = {
         "title": title[:100],
         "description": description[:5000],
@@ -5248,8 +5419,6 @@ def _build_video_upload_request_body(title, description, tags, privacy_status="u
         "snippet": snippet,
         "status": build_youtube_status(privacy_status, schedule_after_hours, publish_at=publish_at),
     }
-    if localizations:
-        body["localizations"] = localizations
     return body
 
 
@@ -5278,8 +5447,7 @@ def _upload_to_youtube_with_client(
 
     log.info("🚀 开启跨国深空打孔传送视频大本尊: %s", os.path.basename(video_path))
     media = MediaFileUpload(video_path, chunksize=1024 * 1024 * 20, resumable=True)
-    insert_parts = "snippet,status,localizations" if body.get("localizations") else "snippet,status"
-    request = youtube.videos().insert(part=insert_parts, body=body, media_body=media)
+    request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
 
     response = None
     retry_count = 0
@@ -5324,6 +5492,26 @@ def _upload_to_youtube_with_client(
                 else:
                     log.error("❌ 尽管做尽处理，但这块门面历经 %d 轮抛投后依然被封杀: %s", max_thumb_retries, e)
 
+    localization_sync = _sync_video_localizations_with_client(
+        youtube,
+        video_id,
+        title=title,
+        description=description,
+        force_overwrite=False,
+    )
+    if localization_sync.get("applied_locales"):
+        log.info(
+            "Video localizations applied for %s: %s",
+            video_id,
+            ", ".join(localization_sync.get("applied_locales", [])),
+        )
+    if localization_sync.get("failed_locales"):
+        log.warning(
+            "Video localization sync partially failed for %s; continuing upload success path. failed=%s",
+            video_id,
+            json.dumps(localization_sync.get("failed_locales", {}), ensure_ascii=False),
+        )
+
     return {
         "video_id": video_id,
         "youtube_url": youtube_url,
@@ -5331,6 +5519,8 @@ def _upload_to_youtube_with_client(
         "title": title[:100],
         "publish_at": _format_youtube_datetime_z(publish_at) if publish_at else "",
         "schedule_reason": str(schedule_reason or ""),
+        "localizations_applied": localization_sync.get("applied_locales", []),
+        "localizations_failed": localization_sync.get("failed_locales", {}),
     }
 
 
@@ -5451,11 +5641,7 @@ def is_playlist_not_found_http_error(error):
 
 def _create_or_update_playlist_with_client(youtube, title, description="", privacy_status="public", playlist_id=""):
     normalized_privacy = normalize_playlist_privacy_status(privacy_status)
-    default_language, generated_localizations = build_youtube_traditional_localizations(title=title, description=description)
-    existing_localizations = _load_playlist_localizations_with_client(youtube, playlist_id) if playlist_id else {}
-    merged_localizations = dict(existing_localizations or {})
-    merged_localizations.update(generated_localizations)
-    request_parts = "snippet,status,localizations" if merged_localizations else "snippet,status"
+    default_language, _generated_localizations = build_youtube_traditional_localizations(title=title, description=description)
     body = {
         "snippet": {
             "title": str(title or "")[:150],
@@ -5466,22 +5652,35 @@ def _create_or_update_playlist_with_client(youtube, title, description="", priva
             "privacyStatus": normalized_privacy,
         },
     }
-    if merged_localizations:
-        body["localizations"] = merged_localizations
 
     if playlist_id:
         body["id"] = playlist_id
-        response = youtube.playlists().update(part=request_parts, body=body).execute()
+        response = youtube.playlists().update(part="snippet,status", body=body).execute()
     else:
-        response = youtube.playlists().insert(part=request_parts, body=body).execute()
+        response = youtube.playlists().insert(part="snippet,status", body=body).execute()
 
     final_playlist_id = response["id"]
+    localization_sync = _sync_playlist_localizations_with_client(
+        youtube,
+        final_playlist_id,
+        title=body["snippet"]["title"],
+        description=body["snippet"]["description"],
+        force_overwrite=False,
+    )
+    if localization_sync.get("failed_locales"):
+        log.warning(
+            "Playlist localization sync partially failed for %s; continuing playlist success path. failed=%s",
+            final_playlist_id,
+            json.dumps(localization_sync.get("failed_locales", {}), ensure_ascii=False),
+        )
     return {
         "playlist_id": final_playlist_id,
         "playlist_url": f"https://www.youtube.com/playlist?list={final_playlist_id}",
         "title": body["snippet"]["title"],
         "description": body["snippet"]["description"],
         "privacy_status": normalized_privacy,
+        "localizations_applied": localization_sync.get("applied_locales", []),
+        "localizations_failed": localization_sync.get("failed_locales", {}),
     }
 
 
