@@ -49,7 +49,6 @@ DEFAULT_RUNTIME_CONFIG = {'POSTGRES_DSN': '',
  'YOUTUBE_DAILY_PUBLISH_LIMIT': 3,
  'YOUTUBE_CATEGORY_ID': '',
  'YOUTUBE_DEFAULT_LANGUAGE': 'zh-CN',
- 'YOUTUBE_DEFAULT_AUDIO_LANGUAGE': 'zh-Hant',
  'ENABLE_YOUTUBE_TRADITIONAL_LOCALIZATION': True,
  'YOUTUBE_LOCALIZATION_LOCALES': 'zh-TW,zh-HK,zh-SG,zh-Hant',
  'YOUTUBE_TRADITIONAL_LOCALE': 'zh-TW',
@@ -4434,13 +4433,6 @@ def get_youtube_default_language():
     return value or "zh-CN"
 
 
-def get_youtube_default_audio_language():
-    value = str(globals().get("YOUTUBE_DEFAULT_AUDIO_LANGUAGE", "") or "").strip()
-    if value:
-        return value
-    return get_youtube_default_language()
-
-
 def youtube_traditional_localization_enabled():
     return bool(globals().get("ENABLE_YOUTUBE_TRADITIONAL_LOCALIZATION", True))
 
@@ -4643,11 +4635,6 @@ def _build_youtube_mutable_video_snippet(snippet, default_language=""):
     category_id = str((snippet or {}).get("categoryId") or "").strip()
     if category_id:
         body_snippet["categoryId"] = category_id
-    default_audio_language = str(
-        (snippet or {}).get("defaultAudioLanguage") or get_youtube_default_audio_language() or ""
-    ).strip()
-    if default_audio_language:
-        body_snippet["defaultAudioLanguage"] = default_audio_language
     return body_snippet
 
 
@@ -5243,14 +5230,11 @@ def _build_video_upload_request_body(title, description, tags, privacy_status="u
     tags_list = normalize_youtube_tags(tags)
     normalized_category_id = normalize_youtube_category_id(category_id)
     default_language, localizations = build_youtube_traditional_localizations(title=title, description=description)
-    default_audio_language = get_youtube_default_audio_language()
     snippet = {
         "title": title[:100],
         "description": description[:5000],
         "defaultLanguage": default_language,
     }
-    if default_audio_language:
-        snippet["defaultAudioLanguage"] = default_audio_language
 
     if tags_list:
         snippet["tags"] = tags_list
