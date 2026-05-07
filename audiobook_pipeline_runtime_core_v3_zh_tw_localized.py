@@ -4709,13 +4709,46 @@ def _fetch_single_playlist_row_with_localizations_with_client(youtube, playlist_
     if not normalized_playlist_id:
         return {}
 
-    response = youtube.playlists().list(
-        part="snippet,localizations",
-        id=normalized_playlist_id,
-        maxResults=1,
-    ).execute()
-    items = response.get("items", [])
-    return dict(items[0]) if items else {}
+    playlist_not_found_retry_count = 0
+    max_playlist_not_found_retries = 6
+    while True:
+        try:
+            response = youtube.playlists().list(
+                part="snippet,localizations",
+                id=normalized_playlist_id,
+                maxResults=1,
+            ).execute()
+        except HttpError as e:
+            if is_playlist_not_found_http_error(e) and playlist_not_found_retry_count < max_playlist_not_found_retries:
+                playlist_not_found_retry_count += 1
+                wait_seconds = min(12, 2 + playlist_not_found_retry_count)
+                log.warning(
+                    "播放列表 %s 暂时还不可读，等待 %d 秒后重试读取（%d/%d）...",
+                    normalized_playlist_id,
+                    wait_seconds,
+                    playlist_not_found_retry_count,
+                    max_playlist_not_found_retries,
+                )
+                time.sleep(wait_seconds)
+                continue
+            raise
+
+        items = response.get("items", [])
+        if items:
+            return dict(items[0])
+        if playlist_not_found_retry_count < max_playlist_not_found_retries:
+            playlist_not_found_retry_count += 1
+            wait_seconds = min(12, 2 + playlist_not_found_retry_count)
+            log.warning(
+                "播放列表 %s 暂时还不可读，等待 %d 秒后重试读取（%d/%d）...",
+                normalized_playlist_id,
+                wait_seconds,
+                playlist_not_found_retry_count,
+                max_playlist_not_found_retries,
+            )
+            time.sleep(wait_seconds)
+            continue
+        return {}
 
 
 def _sync_video_localizations_with_client(youtube, video_id, title="", description="", force_overwrite=False):
@@ -4797,7 +4830,7 @@ def _sync_playlist_localizations_with_client(youtube, playlist_id, title="", des
 
     playlist_row = _fetch_single_playlist_row_with_localizations_with_client(youtube, normalized_playlist_id)
     if not playlist_row:
-        log.warning("Unable to fetch playlist row for localization sync: playlist_id=%s", normalized_playlist_id)
+        log.warning("Unable to fetch playlist row for localization sync after retries: playlist_id=%s", normalized_playlist_id)
         return {"applied_locales": [], "skipped_locales": [], "failed_locales": {}}
 
     snippet = dict(playlist_row.get("snippet") or {})
