@@ -3668,6 +3668,10 @@ class CoverGenerationPolicyRejectedError(RuntimeError):
     """Raised when the provider rejects image generation input and we should fallback."""
 
 
+class MissingYouTubeCredentialsError(RuntimeError):
+    """Raised when the configured YouTube channel has no usable stored credentials."""
+
+
 def _extract_http_error_details(error):
     response = getattr(error, "response", None)
     request = getattr(error, "request", None)
@@ -4676,13 +4680,15 @@ def authenticate_youtube_from_supabase(channel_name):
             (channel_name,),
         )
         if not row:
-            log.error("❌ 无法在数据库找到频道 %s 的授权凭证。请先在初始化单元中写入。", channel_name)
-            return None
+            message = f"无法在数据库找到频道 {channel_name} 的授权凭证。请先在初始化单元中写入。"
+            log.error("❌ %s", message)
+            raise MissingYouTubeCredentialsError(message)
 
         token_info = row.get("token_json")
         if not token_info:
-            log.error("❌ 频道 %s 的凭证数据为空。", channel_name)
-            return None
+            message = f"频道 {channel_name} 的授权凭证数据为空。请先在初始化单元中写入有效凭证。"
+            log.error("❌ %s", message)
+            raise MissingYouTubeCredentialsError(message)
 
         token_dict = json.loads(token_info) if isinstance(token_info, str) else token_info
         credentials = Credentials.from_authorized_user_info(
@@ -7735,14 +7741,19 @@ def run_pipeline(runtime_config: dict | None = None):
         print(f"\n{'=' * 50}")
         log.info("[%d/%d] Book: %s | %s", i, len(all_books), name, cat)
 
+        should_break_after_summary = False
         try:
             result = process_book(book, run_started_at=run_started_at)
+        except MissingYouTubeCredentialsError as e:
+            stop_reason = f"YouTube credential initialization failed: {e}"
+            log.error("[%s] %s", name, stop_reason)
+            result = BookResult(book_id=str(book.get("book_id", "")), book_name=name, category=cat, error=str(e))
+            should_break_after_summary = True
         except Exception as e:
             log.error("[%s] Uncaught exception while processing book: %s", name, e)
             result = BookResult(book_id=str(book.get("book_id", "")), book_name=name, category=cat, error=f"Uncaught exception: {e}")
 
         all_results.append(result)
-        should_break_after_summary = False
 
         if result.success:
             finalize_successful_book_for_project(book, result, name, flag)
