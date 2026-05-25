@@ -34,6 +34,7 @@ DEFAULT_RUNTIME_CONFIG = {'POSTGRES_DSN': '',
  'BOOK_STATE_TABLE': 'book_processing_states',
  'CLEANUP_COMPLETED_SPLIT_STATES': True,
  'PRIORITIZE_INTERRUPTED_BOOKS': True,
+ 'QUIET_RUNTIME_OUTPUT': True,
  'ENABLE_DEEPFILTER': True,
  'segment_duration_minutes': 60,
  'DEEPFILTER_WORKERS': 2,
@@ -227,12 +228,12 @@ def load_cloud_music_runtime_setting(setting_key):
             optional=True,
         )
         if legacy_row:
-            print(f"⚠️ 共享云端配置 {key} 暂未设置，当前临时回退到历史记录中的最新值。")
+            runtime_console_print(f"⚠️ 共享云端配置 {key} 暂未设置，当前临时回退到历史记录中的最新值。", level="WARNING")
             return str(legacy_row.get("setting_value") or "")
 
         return ""
     except Exception as e:
-        print(f"⚠️ 读取数据库运行配置 {key} 失败，先回退到本地值: {e}")
+        runtime_console_print(f"⚠️ 读取数据库运行配置 {key} 失败，先回退到本地值: {e}", level="WARNING")
         return ""
 
 
@@ -241,7 +242,7 @@ def resolve_music_runtime_setting(setting_key, local_value, source="database"):
     local_text = str(local_value or "")
 
     if mode not in {"database", "local"}:
-        print(f"⚠️ {setting_key} 的来源配置无效，当前回退到本地值。")
+        runtime_console_print(f"⚠️ {setting_key} 的来源配置无效，当前回退到本地值。", level="WARNING")
         return local_text
 
     if mode == "local":
@@ -249,11 +250,11 @@ def resolve_music_runtime_setting(setting_key, local_value, source="database"):
 
     cloud_value = load_cloud_music_runtime_setting(setting_key)
     if str(cloud_value).strip():
-        print(f"☁️ 已从数据库读取 {setting_key}")
+        runtime_console_print(f"☁️ 已从数据库读取 {setting_key}", level="INFO")
         return str(cloud_value)
 
     if str(local_text).strip():
-        print(f"⚠️ 数据库中未找到 {setting_key}，当前运行临时回退到本地值。")
+        runtime_console_print(f"⚠️ 数据库中未找到 {setting_key}，当前运行临时回退到本地值。", level="WARNING")
     return local_text
 
 
@@ -340,7 +341,7 @@ def download_file_with_wget(download_url, output_path, headers=None, retries=3):
             if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                 return True
         except Exception as e:
-            print(f"⚠️ wget 下载第 {attempt}/{retries} 次失败: {e}")
+            runtime_console_print(f"⚠️ wget 下载第 {attempt}/{retries} 次失败: {e}", level="WARNING")
 
         time.sleep(min(10, attempt * 2))
 
@@ -366,7 +367,7 @@ def download_file_with_requests(download_url, output_path, headers=None, retries
             if os.path.getsize(output_path) > 0:
                 return True
         except Exception as e:
-            print(f"⚠️ requests 下载第 {attempt}/{retries} 次失败: {e}")
+            runtime_console_print(f"⚠️ requests 下载第 {attempt}/{retries} 次失败: {e}", level="WARNING")
             if os.path.exists(temp_path):
                 os.remove(temp_path)
             time.sleep(min(10, attempt * 2))
@@ -398,7 +399,7 @@ def extract_audio_files_from_zip(zip_path, output_dir, allowed_exts=SUPPORTED_AU
 def download_music_from_dataset_urls():
     url_candidates = parse_text_list_config(HF_DATASET_ZIP_URLS)
     if not url_candidates:
-        print("⚠️ 未配置有效的 HF_DATASET_ZIP_URLS，跳过下载。")
+        runtime_console_print("⚠️ 未配置有效的 HF_DATASET_ZIP_URLS，跳过下载。", level="WARNING")
         return False
 
     selected_input_url = random.choice(url_candidates)
@@ -412,13 +413,13 @@ def download_music_from_dataset_urls():
     archive_name = os.path.basename(urlparse(selected_download_url).path) or "music_bundle.zip"
     archive_path = os.path.join(temp_dir, archive_name)
 
-    print(f"🎲 已随机选择 Datasets 音乐包: {selected_input_url}")
-    print(f"⬇️ 准备下载 ZIP: {selected_download_url}")
+    runtime_console_print(f"🎲 已随机选择 Datasets 音乐包: {selected_input_url}", level="INFO")
+    runtime_console_print(f"⬇️ 准备下载 ZIP: {selected_download_url}", level="INFO")
 
     try:
         ok = download_file_with_wget(selected_download_url, archive_path, headers=headers)
         if not ok:
-            print("⚠️ wget 下载未成功，切换到 requests 流式下载...")
+            runtime_console_print("⚠️ wget 下载未成功，切换到 requests 流式下载...", level="WARNING")
             ok = download_file_with_requests(selected_download_url, archive_path, headers=headers)
 
         if not ok:
@@ -428,10 +429,10 @@ def download_music_from_dataset_urls():
         if not extracted:
             raise RuntimeError("ZIP 下载成功，但解压后未找到任何支持的音频文件")
 
-        print(f"✅ Datasets ZIP 下载并解压完成，共导入 {len(extracted)} 个音频文件到 {LOCAL_MUSIC_DIR}")
+        runtime_console_print(f"✅ Datasets ZIP 下载并解压完成，共导入 {len(extracted)} 个音频文件到 {LOCAL_MUSIC_DIR}", level="INFO")
         return True
     except Exception as e:
-        print(f"❌ Datasets ZIP 下载失败: {e}")
+        runtime_console_print(f"❌ Datasets ZIP 下载失败: {e}", level="ERROR")
         return False
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -442,39 +443,39 @@ def download_music_from_buckets():
 
     bucket_list = [b.strip() for b in BUCKET_IDS.split(",") if b.strip()]
     if not bucket_list or bucket_list[0].startswith("username/my-bucket"):
-        print("⚠️ 未配置有效的 BUCKET_IDS，跳过下载。")
+        runtime_console_print("⚠️ 未配置有效的 BUCKET_IDS，跳过下载。", level="WARNING")
         return False
 
     selected_bucket = random.choice(bucket_list)
-    print(f"🎲 已随机选择 Bucket: {selected_bucket}")
+    runtime_console_print(f"🎲 已随机选择 Bucket: {selected_bucket}", level="INFO")
 
     if HF_TOKEN.strip():
-        print("🔑 正在使用 Token 登录 Hugging Face...")
+        runtime_console_print("🔑 正在使用 Token 登录 Hugging Face...", level="INFO")
         login(token=HF_TOKEN.strip())
 
     os.makedirs(LOCAL_MUSIC_DIR, exist_ok=True)
     globals()["MUSIC_DIR"] = LOCAL_MUSIC_DIR
 
     try:
-        print(f"🔍 正在检索 Bucket {selected_bucket} 中的音频文件...")
+        runtime_console_print(f"🔍 正在检索 Bucket {selected_bucket} 中的音频文件...", level="INFO")
         music_files = [
             item for item in list_bucket_tree(selected_bucket, recursive=True)
             if item.type == "file" and item.path.lower().endswith(SUPPORTED_AUDIO_EXTENSIONS)
         ]
 
         if not music_files:
-            print(f"⚠️ 在 Bucket '{selected_bucket}' 中未找到任何音频文件。")
+            runtime_console_print(f"⚠️ 在 Bucket '{selected_bucket}' 中未找到任何音频文件。", level="WARNING")
             return False
 
-        print(f"⬇️ 发现 {len(music_files)} 首音乐，开始下载到 {LOCAL_MUSIC_DIR}...")
+        runtime_console_print(f"⬇️ 发现 {len(music_files)} 首音乐，开始下载到 {LOCAL_MUSIC_DIR}...", level="INFO")
         download_bucket_files(
             selected_bucket,
             files=[(f, safe_music_output_path(LOCAL_MUSIC_DIR, f.path)) for f in music_files],
         )
-        print("✅ Hugging Face Buckets 版权音乐同步完成！")
+        runtime_console_print("✅ Hugging Face Buckets 版权音乐同步完成！", level="INFO")
         return True
     except Exception as e:
-        print(f"❌ Buckets 下载失败，请检查 Bucket 名称、路径或 Token: {e}")
+        runtime_console_print(f"❌ Buckets 下载失败，请检查 Bucket 名称、路径或 Token: {e}", level="ERROR")
         return False
 
 
@@ -487,7 +488,7 @@ def sync_music_library_if_enabled():
             return download_music_from_buckets()
         return download_music_from_dataset_urls()
 
-    print("⏭️ 已关闭版权音乐自动同步。")
+    runtime_console_print("⏭️ 已关闭版权音乐自动同步。", level="INFO")
     return False
 
 
@@ -514,18 +515,58 @@ from pydub import AudioSegment
 
 import datetime as dt_module
 
+
+def _bool_runtime_value(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def quiet_runtime_output_enabled():
+    return _bool_runtime_value(globals().get("QUIET_RUNTIME_OUTPUT", True), default=True)
+
+
+def runtime_console_print(message="", level="INFO", force=False, end="\n"):
+    normalized_level = str(level or "INFO").strip().upper() or "INFO"
+    if not force and quiet_runtime_output_enabled() and normalized_level not in {"WARNING", "ERROR"}:
+        return
+    print(message, end=end, flush=True)
+
+
+def clear_runtime_output_if_needed():
+    if not quiet_runtime_output_enabled():
+        return False
+
+    try:
+        from IPython.display import clear_output
+
+        clear_output(wait=True)
+        return True
+    except Exception:
+        try:
+            if os.name == "nt":
+                os.system("cls")
+            else:
+                runtime_console_print("\033[2J\033[H", force=True, end="")
+            return True
+        except Exception:
+            return False
+
+
 class SimpleLogger:
     def _now(self):
         return dt_module.datetime.now().strftime("%H:%M:%S")
     def info(self, msg, *args):
         text = msg % args if args else msg
-        print(f"{self._now()} [INFO] {text}")
+        runtime_console_print(f"{self._now()} [INFO] {text}", level="INFO")
     def warning(self, msg, *args):
         text = msg % args if args else msg
-        print(f"{self._now()} [WARNING] {text}")
+        runtime_console_print(f"{self._now()} [WARNING] {text}", level="WARNING")
     def error(self, msg, *args):
         text = msg % args if args else msg
-        print(f"{self._now()} [ERROR] {text}")
+        runtime_console_print(f"{self._now()} [ERROR] {text}", level="ERROR")
 
 log = SimpleLogger()
 
@@ -853,7 +894,7 @@ def setup_deep_filter():
         else:
             shutil.copy(DEEP_FILTER_DRIVE, DEEP_FILTER_PATH)
             subprocess.run(["chmod", "+x", DEEP_FILTER_PATH], check=True)
-    print("✅ DeepFilter 就绪")
+    runtime_console_print("✅ DeepFilter 就绪", level="INFO")
 
 
 if ENABLE_DEEPFILTER:
@@ -7703,7 +7744,7 @@ def run_pipeline(runtime_config: dict | None = None):
         log.info("This run will stop after %d successful uploads.", success_target_count)
 
     if not all_books:
-        print("No books to process.")
+        runtime_console_print("No books to process.", level="INFO")
         return {
             "success": True,
             "results": [],
@@ -7736,9 +7777,12 @@ def run_pipeline(runtime_config: dict | None = None):
             log.warning(stop_reason)
             break
 
+        if i > 1:
+            clear_runtime_output_if_needed()
+
         name = book.get("book_name", "unknown")
         cat = book.get("category", "uncategorized")
-        print(f"\n{'=' * 50}")
+        runtime_console_print(f"\n{'=' * 50}", level="INFO")
         log.info("[%d/%d] Book: %s | %s", i, len(all_books), name, cat)
 
         should_break_after_summary = False
@@ -7812,12 +7856,15 @@ def run_pipeline(runtime_config: dict | None = None):
     partial = sum(1 for r in all_results if getattr(r, "pending_resume", False))
     skipped = sum(1 for r in all_results if getattr(r, "skipped", False))
     failed = len(all_results) - success - partial - skipped
-    print("\n" + "=" * 42)
-    print("  Run Complete")
-    print(f"  Total: {len(all_results)}  Success: {success}  Resume: {partial}  Skipped: {skipped}  Failed: {failed}")
+    runtime_console_print("\n" + "=" * 42, level="INFO")
+    runtime_console_print("  Run Complete", level="INFO")
+    runtime_console_print(
+        f"  Total: {len(all_results)}  Success: {success}  Resume: {partial}  Skipped: {skipped}  Failed: {failed}",
+        level="INFO",
+    )
     if success_target_count > 0:
-        print(f"  Upload Counter: {successful_upload_count}/{success_target_count}")
-    print(f"  Output Dir: {OUTPUT_ROOT}")
+        runtime_console_print(f"  Upload Counter: {successful_upload_count}/{success_target_count}", level="INFO")
+    runtime_console_print(f"  Output Dir: {OUTPUT_ROOT}", level="INFO")
     summary_path = save_run_summary(
         OUTPUT_ROOT,
         all_results,
@@ -7828,8 +7875,8 @@ def run_pipeline(runtime_config: dict | None = None):
             "stop_reason": stop_reason,
         },
     )
-    print(f"  Summary: {summary_path}")
-    print("=" * 42)
+    runtime_console_print(f"  Summary: {summary_path}", level="INFO")
+    runtime_console_print("=" * 42, level="INFO")
 
     return {
         "success": failed == 0 and partial == 0,
