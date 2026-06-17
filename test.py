@@ -4738,6 +4738,48 @@ def generate_video(audio_path, image_path, output_path, resolution="1080p"):
 
     log.info("开始通过 FFmpeg 封装 MP4 视频...")
 
+    # =====================================================================
+    # 统一封面预处理：所有来源的图片在传给 FFmpeg 前都压缩为标准尺寸 JPEG
+    # 避免 2K/5MB 大图导致 Colab /dev/shm 不足、FFmpeg OOM 或解码失败
+    # =====================================================================
+    target_size_map = {"720p": (1280, 720), "1080p": (1920, 1080), "1440p": (2560, 1440), "4k": (3840, 2160)}
+    target_res = target_size_map.get(str(resolution).lower(), (1920, 1080))
+    tw, th = target_res
+
+    processed_image = image_path
+    needs_cleanup = False
+    try:
+        from PIL import Image as PILImage
+        with PILImage.open(image_path) as img:
+            src_w, src_h = img.size
+            # 只有当图片明显大于目标尺寸或不是 JPEG 时才压缩
+            if src_w > tw * 1.1 or src_h > th * 1.1 or img.format != "JPEG":
+                # 居中裁剪到目标宽高比
+                src_ratio = src_w / src_h
+                target_ratio = tw / th
+                if src_ratio > target_ratio:
+                    new_w = int(src_h * target_ratio)
+                    offset = (src_w - new_w) // 2
+                    img = img.crop((offset, 0, offset + new_w, src_h))
+                elif src_ratio < target_ratio:
+                    new_h = int(src_w / target_ratio)
+                    offset = (src_h - new_h) // 2
+                    img = img.crop((0, offset, src_w, offset + new_h))
+                # 缩放到目标分辨率
+                img = img.resize(target_res, PILImage.LANCZOS)
+                # 保存为临时压缩 JPEG
+                processed_image = output_path + ".cover_cache.jpg"
+                img.convert("RGB").save(processed_image, format="JPEG", quality=85)
+                needs_cleanup = True
+                log.info(
+                    "封面预处理：%dx%d → %dx%d JPEG (quality=85)，原始约 %.1f MB",
+                    src_w, src_h, tw, th,
+                    os.path.getsize(image_path) / 1024 / 1024,
+                )
+    except Exception as e:
+        log.warning("封面 PIL 预处理失败，使用原始文件：%s", e)
+        processed_image = image_path
+
     res_to_scale = {"720p": "1280:720", "1080p": "1920:1080", "1440p": "2560:1440", "4k": "3840:2160"}
     scale_vf = res_to_scale.get(str(resolution).lower(), "1920:1080")
 
@@ -4745,7 +4787,7 @@ def generate_video(audio_path, image_path, output_path, resolution="1080p"):
         "ffmpeg", "-y",
         "-loop", "1",
         "-framerate", "1",
-        "-i", image_path,
+        "-i", processed_image,
         "-i", audio_path,
         "-vf", f"scale={scale_vf}:force_original_aspect_ratio=decrease,pad={scale_vf}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
         "-c:v", "libx264",
@@ -4790,6 +4832,9 @@ def generate_video(audio_path, image_path, output_path, resolution="1080p"):
                 mode,
                 os.path.getsize(output_path) / 1024 / 1024,
             )
+            # 清理临时压缩封面缓存
+            if needs_cleanup and os.path.exists(processed_image):
+                os.remove(processed_image)
             return True
 
         last_error = (result.stderr or "").strip()[-1500:]
@@ -4801,6 +4846,9 @@ def generate_video(audio_path, image_path, output_path, resolution="1080p"):
         else:
             log.error("视频封装失败，FFmpeg 报错:\n%s", last_error)
 
+    # 清理临时压缩封面缓存
+    if needs_cleanup and os.path.exists(processed_image):
+        os.remove(processed_image)
     return False
 
 
