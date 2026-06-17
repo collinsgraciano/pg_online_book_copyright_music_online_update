@@ -34,7 +34,7 @@ DEFAULT_RUNTIME_CONFIG = {'POSTGRES_DSN': '',
  'BOOK_STATE_TABLE': 'book_processing_states',
  'CLEANUP_COMPLETED_SPLIT_STATES': True,
  'PRIORITIZE_INTERRUPTED_BOOKS': True,
- 'QUIET_RUNTIME_OUTPUT': False,
+ 'QUIET_RUNTIME_OUTPUT': True,
  'ENABLE_DEEPFILTER': True,
  'segment_duration_minutes': 60,
  'DEEPFILTER_WORKERS': 2,
@@ -525,7 +525,7 @@ def _bool_runtime_value(value, default=False):
 
 
 def quiet_runtime_output_enabled():
-    return _bool_runtime_value(globals().get("QUIET_RUNTIME_OUTPUT", False), default=False)
+    return _bool_runtime_value(globals().get("QUIET_RUNTIME_OUTPUT", True), default=True)
 
 
 def runtime_console_print(message="", level="INFO", force=False, end="\n"):
@@ -4192,6 +4192,166 @@ def _try_generate_cover_with_image_model(output_path, draw_prompt, img_size, ima
     }
 
 
+# =====================================================================
+# 2K 分辨率常量：11 种宽高比的 [width, height] 映射表
+# ModelScope 429 限流时回退到 Sensenova (Podcast AI) 生图使用此尺寸
+# =====================================================================
+_2K_IMAGE_SIZES = {
+    "2:3": (1664, 2496),
+    "3:2": (2496, 1664),
+    "3:4": (1760, 2368),
+    "4:3": (2368, 1760),
+    "4:5": (1824, 2272),
+    "5:4": (2272, 1824),
+    "1:1": (2048, 2048),
+    "16:9": (2752, 1536),
+    "9:16": (1536, 2752),
+    "21:9": (3072, 1376),
+    "9:21": (1344, 3136),
+}
+
+
+def _map_resolution_to_2k_size(resolution="1080p"):
+    """将标准分辨率映射到最接近的 2K 尺寸（宽x高）"""
+    res_to_ratio = {"720p": "4:3", "1080p": "16:9", "1440p": "16:9", "4k": "16:9"}
+    ratio = res_to_ratio.get(str(resolution).lower(), "16:9")
+    return _2K_IMAGE_SIZES.get(ratio, (2752, 1536))
+
+
+def _sensenova_generate_cover_fallback(output_path, draw_prompt, resolution="1080p"):
+    """当 ModelScope 所有 token 生图触发 429 限流时，使用 Sensenova (Podcast AI) 作为最终回退方案。
+
+    使用 2K 分辨率尺寸（2752x1536 等）以确保封面图质量。
+    """
+    from openai import OpenAI
+
+    width, height = _map_resolution_to_2k_size(resolution)
+    size_str = f"{width}x{height}"
+
+    client = OpenAI(
+        base_url=str(globals().get("SENSENOVA_BASE_URL", "https://token.sensenova.cn/v1") or "").strip(),
+        api_key=str(globals().get("SENSENOVA_API_KEY", "") or "").strip(),
+    )
+    model_name = str(
+        globals().get("YOUTUBE_PODCAST_IMAGE_MODEL_PRIMARY", "sensenova-u1-fast") or "sensenova-u1-fast"
+    ).strip()
+    retries = max(1, int(globals().get("YOUTUBE_PODCAST_IMAGE_MODEL_RETRIES", 3) or 3))
+
+    attempts_log = []
+    for attempt_index in range(retries):
+        try:
+            log.info(
+                "🔄 [Sensenova Fallback] 使用 %s 生成 2K 封面图 (%s)...",
+                model_name,
+                size_str,
+            )
+            response = client.images.generate(
+                model=model_name,
+                prompt=draw_prompt,
+                size=size_str,
+                n=1,
+            )
+            image_url = str(response.data[0].url or "").strip()
+            if not image_url:
+                raise ValueError("Sensenova 图片接口未返回可下载的 URL。")
+
+            if download_file(image_url, output_path):
+                log.info(
+                    "🎉 [Sensenova Fallback] 封面图生成成功：%s (尺寸: %s)",
+                    os.path.basename(output_path),
+                    size_str,
+                )
+                return True
+
+            raise ValueError("Sensenova 生成的图片下载到本地后文件为空。")
+        except Exception as e:
+            err_text = _podcast_error_text(e)
+            attempts_log.append(f"attempt {attempt_index + 1}: {err_text}")
+            log.warning(
+                "⚠️ [Sensenova Fallback] 第 %d/%d 次失败：%s",
+                attempt_index + 1,
+                retries,
+                err_text,
+            )
+            if attempt_index < retries - 1:
+                sleep_sec = _podcast_ai_retry_sleep_seconds(attempt_index)
+                time.sleep(sleep_sec)
+
+    log.error(
+        "❌ [Sensenova Fallback] 全部 %d 次重试均失败。错误：%s",
+        retries,
+        " ; ".join(attempts_log),
+    )
+    return False
+
+
+def _call_sensenova_for_draw_prompt(book_name, book_desc):
+    """当 ModelScope 所有文本 token 触发 429 限流时，使用 Sensenova (Podcast AI) 生成封面绘图提示词。
+
+    返回 draw_prompt 字符串，失败时返回空字符串。
+    """
+    from openai import OpenAI
+
+    client = OpenAI(
+        base_url=str(globals().get("SENSENOVA_BASE_URL", "https://token.sensenova.cn/v1") or "").strip(),
+        api_key=str(globals().get("SENSENOVA_API_KEY", "") or "").strip(),
+    )
+    model_name = str(
+        globals().get("YOUTUBE_PODCAST_TEXT_MODEL_PRIMARY", "qwen-plus") or "qwen-plus"
+    ).strip()
+    retries = max(1, int(globals().get("YOUTUBE_PODCAST_TEXT_MODEL_RETRIES", 3) or 3))
+
+    system_prompt = """角色设定：你是一位顶级 YouTube 封面设计师和 AI 绘图提示词专家。你的任务是根据我提供的书名和简介，输出一段可直接用于高质量文生图模型的英文提示词。
+
+设计原则：
+1. 主体必须直接体现书的内容和情绪，适合 YouTube thumbnail 的高点击构图。
+2. 书名对应的中文大字必须作为画面的核心视觉元素，要求醒目、可读、对比强烈。
+3. 允许补充一个极短的中文副标题增强点击欲。
+4. 输出必须强调高对比、高饱和、戏剧光影、电影感和 16:9 横版构图。
+
+最后约束：
+1. 只输出纯英文提示词本身，必须去掉行首的 "Prompt:"、"prompt:" 等前缀。
+2. 不要输出任何多余的汉字解释、不需要英文引导词、不需要 Markdown 块标记。
+3. 提示词长度请控制在 60-120 个英文单词之间。"""
+
+    user_prompt = f"书名：[{book_name}]\n简介：[{book_desc}]"
+
+    for attempt_index in range(retries):
+        try:
+            log.info(
+                "🔄 [Sensenova Fallback Text] 使用 %s 生成封面绘图提示词 (第 %d/%d 次)...",
+                model_name,
+                attempt_index + 1,
+                retries,
+            )
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            result = _podcast_extract_chat_text(response)
+            if result:
+                log.info("✅ [Sensenova Fallback Text] 封面绘图提示词生成成功。")
+                return result
+            raise ValueError("Sensenova 返回的文本内容为空。")
+        except Exception as e:
+            err_text = _podcast_error_text(e)
+            log.warning(
+                "⚠️ [Sensenova Fallback Text] 第 %d/%d 次失败：%s",
+                attempt_index + 1,
+                retries,
+                err_text,
+            )
+            if attempt_index < retries - 1:
+                sleep_sec = _podcast_ai_retry_sleep_seconds(attempt_index)
+                time.sleep(sleep_sec)
+
+    log.error("❌ [Sensenova Fallback Text] 全部 %d 次重试均失败。", retries)
+    return ""
+
+
 def auto_create_youtube_cover(book_name, book_desc, output_path, token, resolution="1080p"):
     text_token_pool = _get_modelscope_usage_token_pool(token, "text")
     image_token_pool = _get_modelscope_usage_token_pool(token, "image")
@@ -4237,6 +4397,23 @@ def auto_create_youtube_cover(book_name, book_desc, output_path, token, resoluti
                 current_cycle_errors.extend([f"prompt: {msg}" for msg in prompt_errors])
 
             if not draw_prompt:
+                # 检查错误是否源于 429 限流，若是则尝试 Sensenova (Podcast AI) 回退生成提示词
+                if any("429" in str(err) or "rate limit" in str(err).lower() or "too many requests" in str(err).lower() for err in prompt_errors):
+                    log.warning(
+                        "⚠️ 所有 ModelScope 文本 token 均触发 429/限流，切换到 Sensenova (Podcast AI) 生成封面绘图提示词..."
+                    )
+                    sensenova_prompt = _call_sensenova_for_draw_prompt(book_name, book_desc)
+                    if sensenova_prompt:
+                        draw_prompt = sensenova_prompt
+                        cached_draw_prompt = draw_prompt
+                        log.info("✅ Sensenova 封面绘图提示词生成成功，继续尝试生图。")
+                    else:
+                        log.warning(
+                            "⚠️ Sensenova 回退文本生成提示词也失败，将从头重试。错误摘要：%s",
+                            " | ".join(prompt_errors[-5:]) if prompt_errors else "无",
+                        )
+
+            if not draw_prompt:
                 log.warning(
                     "⚠️ 封面生成模块第 %d 次失败：当前全部 token 仍未生成有效提示词。错误摘要：%s；系统将持续重试提示词生成，直到成功为止。",
                     attempt,
@@ -4277,8 +4454,18 @@ def auto_create_youtube_cover(book_name, book_desc, output_path, token, resoluti
                 )
 
         if total_image_failures > 0 and all_image_failures_are_429:
+            log.warning(
+                "⚠️ 所有 ModelScope 生图 token 均触发 429/限流，切换到 Sensenova (Podcast AI) 作为最终回退方案..."
+            )
+            sensenova_ok = _sensenova_generate_cover_fallback(
+                output_path=output_path,
+                draw_prompt=draw_prompt,
+                resolution=resolution,
+            )
+            if sensenova_ok:
+                return True
             raise RuntimeError(
-                "同一个封面提示词已在全部可用 token 的两种生图模型上全部触发 429，停止运行。错误摘要：%s"
+                "Sensenova 回退生图也已用完所有重试次数，停止运行。错误摘要：%s"
                 % (" | ".join(current_cycle_errors[-8:]) if current_cycle_errors else "无")
             )
 
