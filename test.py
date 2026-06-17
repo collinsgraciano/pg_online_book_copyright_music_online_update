@@ -19,6 +19,7 @@ DEFAULT_RUNTIME_CONFIG = {'POSTGRES_DSN': '',
  'MODELSCOPE_IMAGE_POLL_CONNECT_TIMEOUT': 300,
  'MODELSCOPE_IMAGE_POLL_READ_TIMEOUT': 300,
  'MODELSCOPE_TOKEN_SWITCH_DELAY_SECONDS': 30,
+ 'API_PRIORITY_ORDER': 'modelscope,sensenova',
  'MAX_RETRIES': 3,
  'AUDIO_DOWNLOAD_CONNECT_TIMEOUT': 20,
  'AUDIO_DOWNLOAD_READ_TIMEOUT': 90,
@@ -4193,6 +4194,148 @@ def _try_generate_cover_with_image_model(output_path, draw_prompt, img_size, ima
 
 
 # =====================================================================
+# API 优先级调度 - 根据 API_PRIORITY_ORDER 配置按优先级调用不同的 API 服务
+# 可用值：modelscope（ModelScope 数据库 Token）、sensenova（Sensenova / Podcast AI）
+# 优先级用逗号分隔，越靠前的优先级越高
+# =====================================================================
+
+
+def _parse_api_priority_order():
+    """解析 API_PRIORITY_ORDER 配置项，返回按优先级排列的 API 名称列表"""
+    raw = str(globals().get("API_PRIORITY_ORDER", "modelscope,sensenova") or "modelscope,sensenova").strip()
+    api_list = [part.strip().lower() for part in raw.split(",") if part.strip()]
+    # 去重但保留顺序
+    seen = set()
+    result = []
+    for api in api_list:
+        if api not in seen and api in frozenset({"modelscope", "sensenova"}):
+            seen.add(api)
+            result.append(api)
+    if not result:
+        result = ["modelscope", "sensenova"]
+    return result
+
+
+def _dispatch_cover_text(book_name, book_desc, text_token_pool, prompt_generation_attempt):
+    """按 API_PRIORITY_ORDER 优先级依次尝试生成封面绘图提示词。
+
+    返回 (draw_prompt, errors) 元组。draw_prompt 为空表示全部失败。
+    """
+    priority_list = _parse_api_priority_order()
+    all_errors = []
+
+    for api_name in priority_list:
+        if api_name == "modelscope":
+            draw_prompt, model_errors = _run_text_task_with_model_fallback(
+                task_label="封面提示词生成",
+                token_pool=text_token_pool,
+                attempt=prompt_generation_attempt,
+                runner=lambda current_token, current_model: _build_youtube_cover_draw_prompt(
+                    book_name,
+                    book_desc,
+                    current_token,
+                    prompt_generation_attempt,
+                    current_model,
+                ),
+                model_sequence=_get_modelscope_text_model_sequence(),
+            )
+            if model_errors:
+                all_errors.extend([f"modelscope: {msg}" for msg in model_errors])
+            if draw_prompt:
+                log.info("✅ [API 优先级] ModelScope 文本生成封面绘图提示词成功。")
+                return draw_prompt, all_errors
+            log.warning("⚠️ [API 优先级] ModelScope 文本生成失败，检查下一优先级 %s ...", priority_list[priority_list.index(api_name) + 1] if priority_list.index(api_name) + 1 < len(priority_list) else "无")
+
+        elif api_name == "sensenova":
+            log.info("🔄 [API 优先级] 切换到 Sensenova (Podcast AI) 生成封面绘图提示词...")
+            sensenova_prompt = _call_sensenova_for_draw_prompt(book_name, book_desc)
+            if sensenova_prompt:
+                log.info("✅ [API 优先级] Sensenova 文本生成封面绘图提示词成功。")
+                return sensenova_prompt, all_errors
+            error_msg = "sensenova: Sensenova 文本生成全部重试失败"
+            all_errors.append(error_msg)
+            log.warning("⚠️ [API 优先级] Sensenova 文本生成失败。")
+
+    return "", all_errors
+
+
+def _dispatch_cover_image(output_path, draw_prompt, resolution, image_token_pool):
+    """按 API_PRIORITY_ORDER 优先级依次尝试生成封面图片。
+
+    返回 True 表示生成成功，False 表示全部失败。
+    使用 errors 列表记录所有错误信息。
+    """
+    priority_list = _parse_api_priority_order()
+    all_image_failures_are_429 = True
+    total_image_failures = 0
+    all_errors = []
+
+    for api_name in priority_list:
+        if api_name == "modelscope":
+            res_to_size = {"720p": "1280x720", "1080p": "1920x1080", "1440p": "2560x1440", "4k": "3840x2160"}
+            img_size = res_to_size.get(str(resolution).lower(), "1920x1080")
+            image_model_sequence = [
+                ("qwen/Qwen-Image-2512", "主生图模型"),
+                ("Tongyi-MAI/Z-Image-Turbo", "回退生图模型"),
+            ]
+            any_model_success = False
+            for model_index, (image_model, model_label) in enumerate(image_model_sequence, start=1):
+                model_result = _try_generate_cover_with_image_model(
+                    output_path=output_path,
+                    draw_prompt=draw_prompt,
+                    img_size=img_size,
+                    image_model=image_model,
+                    token_candidates=clone_modelscope_token_pool(image_token_pool),
+                    invalid_token_pool=image_token_pool,
+                )
+                if model_result["success"]:
+                    return True, []
+
+                if model_result["errors"]:
+                    all_errors.extend([f"modelscope/{image_model}: {msg}" for msg in model_result["errors"]])
+                total_image_failures += int(model_result["failure_count"] or 0)
+                if not model_result["all_failures_are_429"]:
+                    all_image_failures_are_429 = False
+
+                if model_index < len(image_model_sequence):
+                    log.warning(
+                        "⚠️ [API 优先级] %s 在全部 token 上失败，切换到 %s",
+                        image_model,
+                        image_model_sequence[model_index][0],
+                    )
+
+            if any_model_success:
+                return True, []
+
+            if total_image_failures > 0 and all_image_failures_are_429:
+                log.warning(
+                    "⚠️ [API 优先级] ModelScope 图片所有 token 均触发 429，检查下一优先级 %s ...",
+                    priority_list[priority_list.index(api_name) + 1] if priority_list.index(api_name) + 1 < len(priority_list) else "无",
+                )
+            else:
+                log.warning(
+                    "⚠️ [API 优先级] ModelScope 图片生成失败（非全 429），检查下一优先级 %s ...",
+                    priority_list[priority_list.index(api_name) + 1] if priority_list.index(api_name) + 1 < len(priority_list) else "无",
+                )
+
+        elif api_name == "sensenova":
+            log.info("🔄 [API 优先级] 切换到 Sensenova (Podcast AI) 生成封面图片...")
+            sensenova_ok = _sensenova_generate_cover_fallback(
+                output_path=output_path,
+                draw_prompt=draw_prompt,
+                resolution=resolution,
+            )
+            if sensenova_ok:
+                log.info("✅ [API 优先级] Sensenova 封面图片生成成功。")
+                return True, []
+            error_msg = "sensenova: Sensenova 图片生成全部重试失败"
+            all_errors.append(error_msg)
+            log.warning("⚠️ [API 优先级] Sensenova 图片生成失败。")
+
+    return False, all_errors
+
+
+# =====================================================================
 # 2K 分辨率常量：11 种宽高比的 [width, height] 映射表
 # ModelScope 429 限流时回退到 Sensenova (Podcast AI) 生图使用此尺寸
 # =====================================================================
@@ -4353,26 +4496,31 @@ def _call_sensenova_for_draw_prompt(book_name, book_desc):
 
 
 def auto_create_youtube_cover(book_name, book_desc, output_path, token, resolution="1080p"):
-    text_token_pool = _get_modelscope_usage_token_pool(token, "text")
-    image_token_pool = _get_modelscope_usage_token_pool(token, "image")
-    if not text_token_pool:
-        raise ValueError("未提供 ModelScope 文字 Token，无法生成 AI 海报。")
-    if not image_token_pool:
-        raise ValueError("未提供 ModelScope 生图 Token，无法生成 AI 海报。")
+    """使用 API_PRIORITY_ORDER 配置的优先级链生成 YouTube 封面图。
+
+    支持按优先级顺序尝试 modelscope、sensenova 等 API 服务，
+    高优先级服务不可用时自动降级到次优先级。
+    """
+    priority_list = _parse_api_priority_order()
+    needs_modelscope_text = "modelscope" in priority_list
+    needs_modelscope_image = "modelscope" in priority_list
+
+    # 按需验证 Token 可用性，避免不必要的报错
+    if needs_modelscope_text or needs_modelscope_image:
+        text_token_pool = _get_modelscope_usage_token_pool(token, "text")
+        image_token_pool = _get_modelscope_usage_token_pool(token, "image")
 
     res_to_size = {"720p": "1280x720", "1080p": "1920x1080", "1440p": "2560x1440", "4k": "3840x2160"}
     img_size = res_to_size.get(str(resolution).lower(), "1920x1080")
 
-    log.info("【🖼️ AI绘图】[%s] 分析有声书意境提取并生成高宽容度爆款 YouTube 封面 (%s)...", book_name, img_size)
+    log.info(
+        "【🖼️ AI绘图】[%s] 分析有声书意境提取并生成高宽容度爆款 YouTube 封面 (%s)... API 优先级: %s",
+        book_name, img_size, " → ".join(priority_list),
+    )
 
     attempt = 0
     prompt_generation_attempt = 0
     cached_draw_prompt = ""
-    text_model_sequence = _get_modelscope_text_model_sequence()
-    image_model_sequence = [
-        ("qwen/Qwen-Image-2512", "主生图模型"),
-        ("Tongyi-MAI/Z-Image-Turbo", "回退生图模型"),
-    ]
 
     while True:
         attempt += 1
@@ -4380,97 +4528,46 @@ def auto_create_youtube_cover(book_name, book_desc, output_path, token, resoluti
         draw_prompt = cached_draw_prompt
         if not draw_prompt:
             prompt_generation_attempt += 1
-            draw_prompt, prompt_errors = _run_text_task_with_model_fallback(
-                task_label="封面提示词生成",
-                token_pool=text_token_pool,
-                attempt=prompt_generation_attempt,
-                runner=lambda current_token, current_model: _build_youtube_cover_draw_prompt(
-                    book_name,
-                    book_desc,
-                    current_token,
-                    prompt_generation_attempt,
-                    current_model,
-                ),
-                model_sequence=text_model_sequence,
+
+            # 使用优先级调度获取封面绘图提示词
+            draw_prompt, prompt_errors = _dispatch_cover_text(
+                book_name=book_name,
+                book_desc=book_desc,
+                text_token_pool=text_token_pool if needs_modelscope_text else None,
+                prompt_generation_attempt=prompt_generation_attempt,
             )
             if prompt_errors:
-                current_cycle_errors.extend([f"prompt: {msg}" for msg in prompt_errors])
+                current_cycle_errors.extend(prompt_errors)
 
-            if not draw_prompt:
-                # 检查错误是否源于 429 限流，若是则尝试 Sensenova (Podcast AI) 回退生成提示词
-                if any("429" in str(err) or "rate limit" in str(err).lower() or "too many requests" in str(err).lower() for err in prompt_errors):
-                    log.warning(
-                        "⚠️ 所有 ModelScope 文本 token 均触发 429/限流，切换到 Sensenova (Podcast AI) 生成封面绘图提示词..."
-                    )
-                    sensenova_prompt = _call_sensenova_for_draw_prompt(book_name, book_desc)
-                    if sensenova_prompt:
-                        draw_prompt = sensenova_prompt
-                        cached_draw_prompt = draw_prompt
-                        log.info("✅ Sensenova 封面绘图提示词生成成功，继续尝试生图。")
-                    else:
-                        log.warning(
-                            "⚠️ Sensenova 回退文本生成提示词也失败，将从头重试。错误摘要：%s",
-                            " | ".join(prompt_errors[-5:]) if prompt_errors else "无",
-                        )
-
-            if not draw_prompt:
+            if draw_prompt:
+                cached_draw_prompt = draw_prompt
+            else:
                 log.warning(
-                    "⚠️ 封面生成模块第 %d 次失败：当前全部 token 仍未生成有效提示词。错误摘要：%s；系统将持续重试提示词生成，直到成功为止。",
+                    "⚠️ 封面生成模块第 %d 次失败：所有 API 优先级均未能生成有效提示词。错误摘要：%s；系统将持续重试，直到成功为止。",
                     attempt,
                     " | ".join(current_cycle_errors[-5:]) if current_cycle_errors else "无",
                 )
                 time.sleep(min(30, 5 + attempt))
                 continue
 
-            cached_draw_prompt = draw_prompt
         else:
             log.info("🧠 第 %d 次封面重试将复用上一次成功生成的生图提示词，不再重新生成提示词。", attempt)
 
-        total_image_failures = 0
-        all_image_failures_are_429 = True
-        for model_index, (image_model, model_label) in enumerate(image_model_sequence, start=1):
-            model_result = _try_generate_cover_with_image_model(
-                output_path=output_path,
-                draw_prompt=draw_prompt,
-                img_size=img_size,
-                image_model=image_model,
-                token_candidates=clone_modelscope_token_pool(image_token_pool),
-                invalid_token_pool=image_token_pool,
-            )
-            if model_result["success"]:
-                return True
+        # 使用优先级调度生成封面图片
+        image_ok, image_errors = _dispatch_cover_image(
+            output_path=output_path,
+            draw_prompt=draw_prompt,
+            resolution=resolution,
+            image_token_pool=image_token_pool if needs_modelscope_image else None,
+        )
+        if image_ok:
+            return True
 
-            if model_result["errors"]:
-                current_cycle_errors.extend([f"{image_model}: {msg}" for msg in model_result["errors"]])
-            total_image_failures += int(model_result["failure_count"] or 0)
-            if not model_result["all_failures_are_429"]:
-                all_image_failures_are_429 = False
-
-            if model_index < len(image_model_sequence):
-                log.warning(
-                    "⚠️ %s 在当前全部可用 token 上都生成失败，开始自动切换到 %s 再完整重试一轮。",
-                    image_model,
-                    image_model_sequence[model_index][0],
-                )
-
-        if total_image_failures > 0 and all_image_failures_are_429:
-            log.warning(
-                "⚠️ 所有 ModelScope 生图 token 均触发 429/限流，切换到 Sensenova (Podcast AI) 作为最终回退方案..."
-            )
-            sensenova_ok = _sensenova_generate_cover_fallback(
-                output_path=output_path,
-                draw_prompt=draw_prompt,
-                resolution=resolution,
-            )
-            if sensenova_ok:
-                return True
-            raise RuntimeError(
-                "Sensenova 回退生图也已用完所有重试次数，停止运行。错误摘要：%s"
-                % (" | ".join(current_cycle_errors[-8:]) if current_cycle_errors else "无")
-            )
+        if image_errors:
+            current_cycle_errors.extend(image_errors)
 
         log.warning(
-            "⚠️ 封面生成模块第 %d 次失败：Qwen 生图与 Tongyi 回退生图都已在当前可用 token 上完整尝试仍未成功。错误摘要：%s；系统将持续复用当前提示词重试生图，直到成功为止。",
+            "⚠️ 封面生成模块第 %d 次失败：所有 API 优先级均未能生成封面图片。错误摘要：%s；系统将持续复用当前提示词重试，直到成功为止。",
             attempt,
             " | ".join(current_cycle_errors[-6:]) if current_cycle_errors else "无",
         )
