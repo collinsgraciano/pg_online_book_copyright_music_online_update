@@ -4364,7 +4364,8 @@ def _map_resolution_to_2k_size(resolution="1080p"):
 def _sensenova_generate_cover_fallback(output_path, draw_prompt, resolution="1080p"):
     """当 ModelScope 所有 token 生图触发 429 限流时，使用 Sensenova (Podcast AI) 作为最终回退方案。
 
-    使用 2K 分辨率尺寸（2752x1536 等）以确保封面图质量。
+    使用 2K 分辨率尺寸（2752x1536 等）以确保封面图质量，
+    下载后自动压缩为 1920x1080 JPEG（quality 85）避免 FFmpeg 封装失败。
     """
     from openai import OpenAI
 
@@ -4379,6 +4380,10 @@ def _sensenova_generate_cover_fallback(output_path, draw_prompt, resolution="108
         globals().get("YOUTUBE_PODCAST_IMAGE_MODEL_PRIMARY", "sensenova-u1-fast") or "sensenova-u1-fast"
     ).strip()
     retries = max(1, int(globals().get("YOUTUBE_PODCAST_IMAGE_MODEL_RETRIES", 3) or 3))
+
+    # FFmpeg 兼容的目标尺寸（1920x1080 JPEG quality 85，约 200-500KB）
+    target_size_map = {"720p": (1280, 720), "1080p": (1920, 1080), "1440p": (2560, 1440), "4k": (3840, 2160)}
+    target_res = target_size_map.get(str(resolution).lower(), (1920, 1080))
 
     attempts_log = []
     for attempt_index in range(retries):
@@ -4398,15 +4403,57 @@ def _sensenova_generate_cover_fallback(output_path, draw_prompt, resolution="108
             if not image_url:
                 raise ValueError("Sensenova 图片接口未返回可下载的 URL。")
 
-            if download_file(image_url, output_path):
+            # 先下载到临时文件
+            tmp_path = output_path + ".sensenova_tmp"
+            if not download_file(image_url, tmp_path):
+                raise ValueError("Sensenova 图片下载失败。")
+
+            # 用 PIL 压缩为标准 1920x1080 JPEG，避免大图导致 FFmpeg OOM
+            try:
+                from PIL import Image as PILImage
+
+                with PILImage.open(tmp_path) as img:
+                    # 居中裁剪到目标比例，再缩放到目标尺寸
+                    tw, th = target_res
+                    src_w, src_h = img.size
+                    src_ratio = src_w / src_h
+                    target_ratio = tw / th
+
+                    if src_ratio > target_ratio:
+                        # 原图太宽，裁剪左右
+                        new_w = int(src_h * target_ratio)
+                        offset = (src_w - new_w) // 2
+                        crop = img.crop((offset, 0, offset + new_w, src_h))
+                    else:
+                        # 原图太高，裁剪上下
+                        new_h = int(src_w / target_ratio)
+                        offset = (src_h - new_h) // 2
+                        crop = img.crop((0, offset, src_w, offset + new_h))
+
+                    resized = crop.resize(target_res, PILImage.LANCZOS)
+                    resized.convert("RGB").save(output_path, format="JPEG", quality=85)
+                    log.info(
+                        "✅ Sensenova 原始图片已压缩为 %dx%d JPEG（quality=85）",
+                        tw, th,
+                    )
+            except Exception as pil_err:
+                log.warning("⚠️ Sensenova 图片 PIL 压缩失败，回退使用原始文件: %s", pil_err)
+                if os.path.exists(tmp_path):
+                    os.replace(tmp_path, output_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                 log.info(
-                    "🎉 [Sensenova Fallback] 封面图生成成功：%s (尺寸: %s)",
+                    "🎉 [Sensenova Fallback] 封面图生成成功：%s (原始尺寸: %s, 约 %.1f MB)",
                     os.path.basename(output_path),
                     size_str,
+                    os.path.getsize(output_path) / 1024 / 1024,
                 )
                 return True
 
-            raise ValueError("Sensenova 生成的图片下载到本地后文件为空。")
+            raise ValueError("Sensenova 生成的文件为空。")
         except Exception as e:
             err_text = _podcast_error_text(e)
             attempts_log.append(f"attempt {attempt_index + 1}: {err_text}")
