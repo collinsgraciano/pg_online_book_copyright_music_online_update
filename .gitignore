@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+_scan_files.py
+_test_import.py
+_update_notebook.py
+.DS_Store
+*.tmp
+_book_reports/
+_run_reports/
